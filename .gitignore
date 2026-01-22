@@ -80,3 +80,6 @@ nul
 
 # Logs
 *.log
+
+# Installer output
+installer_output/

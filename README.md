@@ -21,13 +21,19 @@ A cross-platform desktop application for reading and visualizing Kismet wireless
 - **Timeline View**: Temporal analysis of device activity
 - **Export Options**: Export data to CSV, JSON, KML, and PDF formats
 
-## Requirements
+## Installation
 
+### Windows Installer (Recommended)
+
+Download the latest installer from the [Releases](https://github.com/FadeVT/kismet-gui-reader/releases) page:
+- `KismetGUIReader_Setup_1.0.0.exe` - Windows installer with all dependencies included
+
+### From Source
+
+**Requirements:**
 - Python 3.10+
 - PyQt6
 - PyQt6-WebEngine (for map visualization)
-
-## Installation
 
 1. Clone the repository:
    ```bash
@@ -55,6 +61,7 @@ A cross-platform desktop application for reading and visualizing Kismet wireless
 - reportlab - PDF generation
 - simplekml - KML export
 - openpyxl - Excel export support
+- folium - Map export
 
 ## Usage
 
@@ -66,9 +73,26 @@ A cross-platform desktop application for reading and visualizing Kismet wireless
    - **Statistics**: Charts and analysis
    - **Timeline**: Temporal device activity
 
-## Screenshots
+## Building from Source
 
-*Coming soon*
+### Windows Executable
+
+```bash
+pip install pyinstaller
+python -m PyInstaller kismet_gui_reader.spec --clean
+```
+
+The executable will be created in the `dist/` folder.
+
+### Windows Installer
+
+Requires [Inno Setup](https://jrsoftware.org/isinfo.php):
+
+```bash
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+```
+
+The installer will be created in the `installer_output/` folder.
 
 ## License
 
