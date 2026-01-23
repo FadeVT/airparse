@@ -73,6 +73,29 @@ Download the latest installer from the [Releases](https://github.com/FadeVT/kism
    - **Statistics**: Charts and analysis
    - **Timeline**: Temporal device activity
 
+## Screenshots
+
+### Statistics Dashboard
+![Statistics](screenshots/1.%20Stats.png)
+
+### Access Points
+![Access Points](screenshots/2.%20AP.png)
+
+### SSID View
+![SSID View](screenshots/3.%20SSID.png)
+
+### Alerts
+![Alerts](screenshots/4.%20Alerts.png)
+
+### Map with Clustering
+![Map Clustering](screenshots/5.%20Map_Cluster.png)
+
+### Map with Heatmap
+![Map Heatmap](screenshots/6.%20Map_Heat.png)
+
+### Map with Satellite View
+![Map Satellite](screenshots/7.%20Map_Sat.png)
+
 ## Building from Source
 
 ### Windows Executable
