@@ -1,4 +1,4 @@
-"""Configuration settings for Kismet GUI Reader."""
+"""Configuration settings for AirParse."""
 
 DEFAULT_CONFIG = {
     'ui': {

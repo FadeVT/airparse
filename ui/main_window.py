@@ -1,4 +1,4 @@
-"""Main window for Kismet GUI Reader."""
+"""Main window for AirParse."""
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -52,7 +52,7 @@ class MainWindow(QMainWindow):
 
     def setup_ui(self):
         """Set up the main UI layout."""
-        self.setWindowTitle("Kismet Database Reader")
+        self.setWindowTitle("AirParse")
         self.setMinimumSize(1200, 800)
 
         # Create central widget with main layout
@@ -1442,10 +1442,10 @@ class MainWindow(QMainWindow):
         """Show the About dialog."""
         QMessageBox.about(
             self,
-            "About Kismet Database Reader",
-            "Kismet Database GUI Reader\n\n"
-            "A cross-platform desktop application for reading and visualizing "
-            "Kismet wireless network capture data.\n\n"
+            "About AirParse",
+            "AirParse — Wireless Capture Analyzer\n\n"
+            "Analyze Kismet databases and PCAP captures with interactive maps, "
+            "device analysis, and hashcat WPA cracking.\n\n"
             "Built with PyQt6"
         )
 

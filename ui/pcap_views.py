@@ -57,7 +57,7 @@ def _reverse_geocode(lat: float, lon: float) -> str:
         url = (f"https://nominatim.openstreetmap.org/reverse?"
                f"lat={lat}&lon={lon}&format=json&zoom=18&addressdetails=1")
         req = urllib.request.Request(
-            url, headers={'User-Agent': 'KismetGUIReader/1.0'})
+            url, headers={'User-Agent': 'AirParse/2.0'})
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
             addr = data.get('address', {})

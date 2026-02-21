@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Kismet GUI Reader — Setup Script
+# AirParse — Setup Script
 # Detects distro and installs dependencies, creates venv, and desktop entry.
 
 set -euo pipefail
 
-APP_NAME="kismet-gui-reader"
+APP_NAME="airparse"
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${APP_DIR}/venv"
 DESKTOP_FILE="${HOME}/.local/share/applications/${APP_NAME}.desktop"
@@ -133,8 +133,8 @@ create_desktop_entry() {
     cat > "$DESKTOP_FILE" << EOF
 [Desktop Entry]
 Type=Application
-Name=Kismet GUI Reader
-Comment=Offline wireless capture analyzer (Kismet DB, PCAP)
+Name=AirParse
+Comment=Wireless capture analyzer (Kismet DB, PCAP, hashcat cracking)
 Exec=${VENV_DIR}/bin/python3 ${APP_DIR}/main.py
 Path=${APP_DIR}
 Terminal=false
@@ -210,8 +210,8 @@ verify() {
 # --- Main ---
 main() {
     echo ""
-    echo "  Kismet GUI Reader — Setup"
-    echo "  ========================="
+    echo "  AirParse — Setup"
+    echo "  ================="
     echo ""
 
     local distro

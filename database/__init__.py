@@ -1,4 +1,4 @@
-"""Database module for Kismet GUI Reader."""
+"""Database module for AirParse."""
 
 from .reader import KismetDBReader
 from .queries import KismetQueries

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Kismet Database GUI Reader
+AirParse — Wireless Capture Analyzer
 
-A cross-platform desktop application for reading and visualizing
-Kismet wireless network capture data from .kismet database files.
+A cross-platform desktop application for analyzing wireless capture data.
+Supports Kismet .kismet databases and PCAP/PCAPNG files with hashcat
+WPA cracking, interactive maps, and multi-format export.
 """
 
 import sys
@@ -22,9 +23,9 @@ def main():
 
     # Create application
     app = QApplication(sys.argv)
-    app.setApplicationName("Kismet Database Reader")
-    app.setApplicationVersion("1.0.0")
-    app.setOrganizationName("KismetGUI")
+    app.setApplicationName("AirParse")
+    app.setApplicationVersion("2.0.0")
+    app.setOrganizationName("AirParse")
 
     # Create and show main window
     window = MainWindow()

@@ -1,4 +1,4 @@
-"""Utilities module for Kismet GUI Reader."""
+"""Utilities module for AirParse."""
 
 from .oui_lookup import OUILookup, lookup_manufacturer, is_randomized_mac, get_oui_lookup
 from .geo_utils import (

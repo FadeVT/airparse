@@ -1,4 +1,4 @@
-"""Export module for Kismet GUI Reader."""
+"""Export module for AirParse."""
 
 from .csv_exporter import CSVExporter, export_to_csv
 from .json_exporter import JSONExporter, export_to_json

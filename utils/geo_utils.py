@@ -1,4 +1,4 @@
-"""Geographic utility functions for Kismet GUI Reader."""
+"""Geographic utility functions for AirParse."""
 
 import math
 from typing import Tuple, List, Optional

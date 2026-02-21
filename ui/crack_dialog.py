@@ -346,7 +346,7 @@ class _WordlistDownloader(QThread):
 
             try:
                 req = urllib.request.Request(url, headers={
-                    'User-Agent': 'KismetGUIReader/1.0'
+                    'User-Agent': 'AirParse/2.0'
                 })
                 resp = urllib.request.urlopen(req, timeout=30)
                 total = int(resp.headers.get('Content-Length', 0))

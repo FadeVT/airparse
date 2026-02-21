@@ -1,1 +1,1 @@
-"""Tests module for Kismet GUI Reader."""
+"""Tests module for AirParse."""

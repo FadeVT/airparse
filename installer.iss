@@ -1,16 +1,16 @@
 [Setup]
-AppName=Kismet GUI Reader
+AppName=AirParse
 AppVersion=1.0.0
 AppPublisher=FadeVT
-AppPublisherURL=https://github.com/FadeVT/kismet-gui-reader
-AppSupportURL=https://github.com/FadeVT/kismet-gui-reader/issues
-AppUpdatesURL=https://github.com/FadeVT/kismet-gui-reader/releases
-DefaultDirName={autopf}\Kismet GUI Reader
-DefaultGroupName=Kismet GUI Reader
+AppPublisherURL=https://github.com/FadeVT/airparse
+AppSupportURL=https://github.com/FadeVT/airparse/issues
+AppUpdatesURL=https://github.com/FadeVT/airparse/releases
+DefaultDirName={autopf}\AirParse
+DefaultGroupName=AirParse
 AllowNoIcons=yes
 LicenseFile=
 OutputDir=installer_output
-OutputBaseFilename=KismetGUIReader_Setup_1.0.0
+OutputBaseFilename=AirParse_Setup_1.0.0
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -24,12 +24,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "dist\KismetGUIReader.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\AirParse.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Kismet GUI Reader"; Filename: "{app}\KismetGUIReader.exe"
-Name: "{group}\{cm:UninstallProgram,Kismet GUI Reader}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Kismet GUI Reader"; Filename: "{app}\KismetGUIReader.exe"; Tasks: desktopicon
+Name: "{group}\AirParse"; Filename: "{app}\AirParse.exe"
+Name: "{group}\{cm:UninstallProgram,AirParse}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\AirParse"; Filename: "{app}\AirParse.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\KismetGUIReader.exe"; Description: "{cm:LaunchProgram,Kismet GUI Reader}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\AirParse.exe"; Description: "{cm:LaunchProgram,AirParse}"; Flags: nowait postinstall skipifsilent
