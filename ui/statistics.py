@@ -1,5 +1,6 @@
 """Statistics panel — landing page with haul summary, highlights, and hero map."""
 
+import json
 import pandas as pd
 
 from PyQt6.QtWidgets import (
@@ -155,19 +156,107 @@ class StatisticsPanel(QWidget):
         map_inner.setContentsMargins(2, 2, 2, 2)
 
         if HAS_WEBENGINE:
-            from ui.map_view import MapView
-            self._mini_map = MapView()
-            self._mini_map.setSizePolicy(
+            self._hero_map = QWebEngineView()
+            self._hero_map.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            map_inner.addWidget(self._mini_map)
+            self._hero_map_ready = False
+            self._hero_pending_devices = None
+            map_inner.addWidget(self._hero_map)
         else:
-            self._mini_map = None
+            self._hero_map = None
             placeholder = QLabel("Map requires PyQt6-WebEngine")
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             placeholder.setStyleSheet("color: #ccc; padding: 80px; font-size: 14px;")
             map_inner.addWidget(placeholder)
 
         main_layout.addWidget(self._map_frame, 1)  # stretch=1 so map fills space
+
+        # Defer hero map HTML load until first show
+        self._hero_map_initialized = False
+
+    def showEvent(self, event):
+        """Initialize hero map HTML on first show."""
+        super().showEvent(event)
+        if not self._hero_map_initialized and self._hero_map is not None:
+            self._hero_map_initialized = True
+            self._hero_map.loadFinished.connect(self._on_hero_map_loaded)
+            self._hero_map.setHtml(self._generate_hero_map_html())
+
+    def _on_hero_map_loaded(self, ok: bool):
+        """Handle hero map page load."""
+        if not ok:
+            self._hero_map_ready = False
+            return
+        self._hero_map_ready = True
+        if self._hero_pending_devices is not None:
+            devices_json = json.dumps(self._hero_pending_devices)
+            self._hero_map.page().runJavaScript(f"setDevices({devices_json});")
+            self._hero_pending_devices = None
+
+    @staticmethod
+    def _generate_hero_map_html() -> str:
+        """Generate minimal Leaflet HTML for the landing page hero map.
+
+        Dark Matter tiles, cyan canvas dots, no controls, no plugins.
+        """
+        return '''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { margin: 0; padding: 0; }
+        html, body { width: 100vw; height: 100vh; overflow: hidden; }
+        #map { width: 100vw; height: 100vh; background: #1a1a2e; }
+        .leaflet-control-attribution { display: none !important; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+    var map = L.map('map', {
+        zoomControl: false,
+        attributionControl: false
+    }).setView([39.8283, -98.5795], 4);
+
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        subdomains: 'abcd',
+        maxZoom: 20
+    }).addTo(map);
+
+    var canvasRenderer = L.canvas({ padding: 0.5 });
+    var markers = L.layerGroup().addTo(map);
+
+    function setDevices(devices) {
+        markers.clearLayers();
+        if (!devices || devices.length === 0) return;
+        var bounds = [];
+        devices.forEach(function(d) {
+            L.circleMarker([d.lat, d.lon], {
+                renderer: canvasRenderer,
+                radius: 4,
+                fillColor: '#00d4ff',
+                color: 'rgba(255,255,255,0.3)',
+                weight: 1,
+                opacity: 0.9,
+                fillOpacity: 0.7
+            }).addTo(markers);
+            bounds.push([d.lat, d.lon]);
+        });
+        if (bounds.length > 0) {
+            map.fitBounds(bounds, {padding: [30, 30]});
+        }
+    }
+
+    window.addEventListener('resize', function() { map.invalidateSize(); });
+    new ResizeObserver(function() { map.invalidateSize(); }).observe(document.getElementById('map'));
+    setTimeout(function() { map.invalidateSize(); }, 100);
+    setTimeout(function() { map.invalidateSize(); }, 300);
+    setTimeout(function() { map.invalidateSize(); }, 1000);
+    </script>
+</body>
+</html>'''
 
     @staticmethod
     def _compute_miles_driven(gps_df: pd.DataFrame) -> float:
@@ -222,8 +311,8 @@ class StatisticsPanel(QWidget):
                 self.hl_most_probed.set_value(f"{top_ssid} ({top_count} APs)")
 
     def show_mini_map(self, devices_df: pd.DataFrame, gps_df: pd.DataFrame = None):
-        """Plot device markers and GPS track on the hero map."""
-        if self._mini_map is None:
+        """Plot device dots on the hero map (no track lines, dots only)."""
+        if self._hero_map is None:
             return
 
         if devices_df is None or devices_df.empty:
@@ -245,10 +334,19 @@ class StatisticsPanel(QWidget):
         if valid.empty:
             return
 
-        self._mini_map.plot_devices(devices_df)
+        # Build lightweight device list — just coords, no metadata
+        devices = []
+        for _, row in valid.iterrows():
+            devices.append({
+                'lat': float(row[lat_col]),
+                'lon': float(row[lon_col])
+            })
 
-        if gps_df is not None and not gps_df.empty:
-            self._mini_map.plot_gps_track(gps_df)
+        if self._hero_map_ready:
+            devices_json = json.dumps(devices)
+            self._hero_map.page().runJavaScript(f"setDevices({devices_json});")
+        else:
+            self._hero_pending_devices = devices
 
     def set_alert_count(self, count: int):
         pass  # Removed from landing page — available in individual tabs

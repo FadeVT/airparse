@@ -140,12 +140,12 @@ def device_type_to_color(device_type: str) -> str:
         Color hex code string
     """
     colors = {
-        'Wi-Fi AP': '#3498db',      # Blue
-        'Wi-Fi Client': '#2ecc71',   # Green
+        'Wi-Fi AP': '#00d4ff',       # Cyan
+        'Wi-Fi Client': '#FF1493',   # Hot Pink
         'Bluetooth': '#9b59b6',      # Purple
         'BTLE': '#e74c3c',           # Red
-        'IEEE802.11': '#3498db',     # Blue
-        'default': '#95a5a6'         # Gray
+        'IEEE802.11': '#00d4ff',     # Cyan
+        'default': '#00d4ff'         # Cyan
     }
     return colors.get(device_type, colors['default'])
 

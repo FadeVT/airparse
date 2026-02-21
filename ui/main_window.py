@@ -1214,11 +1214,6 @@ class MainWindow(QMainWindow):
 
             self.main_map_view.plot_devices(devices_df)
 
-        # Load GPS track data
-        gps_df = self.db_reader.get_gps_data()
-        if not gps_df.empty:
-            self.main_map_view.plot_gps_track(gps_df)
-
     def _on_timeline_range_selected(self, start, end):
         """Handle time range selection from timeline."""
         self.status_bar.showMessage(

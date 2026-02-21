@@ -199,7 +199,8 @@ class PcapReader:
         self._file_size: int = 0
 
         # Companion WiGLE GPS data (loaded from external CSV files)
-        self._wigle_gps: dict[str, dict] = {}  # mac_lower -> {min_lat, max_lat, min_lon, max_lon, alt, ssid}
+        # Each MAC accumulates detection points for signal-weighted centroid
+        self._wigle_gps: dict[str, dict] = {}  # mac_lower -> {detections: [(lat, lon, weight)], alt, ssid, centroid_lat, centroid_lon, min/max bounds}
 
     def open_database(self, path: str) -> bool:
         """Validate a PCAP file can be opened."""
@@ -917,10 +918,16 @@ class PcapReader:
 
         Pineapple loot zips store GPS data in separate WiGLE CSV files
         alongside the PCAP. This merges that GPS data into our records.
+
+        Computes a signal-weighted centroid for each MAC — stronger RSSI
+        detections (scanner was closer) get more weight, shifting the
+        plotted position from "where the car was" toward "where the AP is."
         """
         import csv
 
         self._wigle_gps.clear()
+        # Temporary accumulator: mac -> list of (lat, lon, weight)
+        detections: dict[str, list] = {}
 
         for csv_path in csv_paths:
             try:
@@ -938,12 +945,18 @@ class PcapReader:
                         if lat == 0 and lon == 0:
                             continue
 
-                        if mac not in self._wigle_gps:
+                        rssi = float(row.get('RSSI', -80) or -80)
+                        # Convert RSSI to linear weight: -30 dBm → ~1000, -80 dBm → ~1, -100 dBm → ~0.01
+                        weight = 10.0 ** ((rssi + 100.0) / 20.0)
+
+                        if mac not in detections:
+                            detections[mac] = []
                             self._wigle_gps[mac] = {
                                 'min_lat': lat, 'max_lat': lat,
                                 'min_lon': lon, 'max_lon': lon,
                                 'alt': float(row.get('AltitudeMeters', 0) or 0),
                                 'ssid': (row.get('SSID', '') or '').strip('"'),
+                                'centroid_lat': 0.0, 'centroid_lon': 0.0,
                             }
                         else:
                             d = self._wigle_gps[mac]
@@ -955,18 +968,39 @@ class PcapReader:
                                 d['min_lon'] = lon
                             if lon > d['max_lon']:
                                 d['max_lon'] = lon
+
+                        detections[mac].append((lat, lon, weight))
             except Exception:
                 continue
+
+        # Compute signal-weighted centroid for each MAC
+        for mac, pts in detections.items():
+            total_weight = sum(w for _, _, w in pts)
+            if total_weight > 0:
+                clat = sum(lat * w for lat, _, w in pts) / total_weight
+                clon = sum(lon * w for _, lon, w in pts) / total_weight
+            else:
+                # Fallback: simple average
+                clat = sum(lat for lat, _, _ in pts) / len(pts)
+                clon = sum(lon for _, lon, _ in pts) / len(pts)
+            self._wigle_gps[mac]['centroid_lat'] = clat
+            self._wigle_gps[mac]['centroid_lon'] = clon
 
     def has_gps_data(self) -> bool:
         """Check if companion GPS data has been loaded."""
         return bool(self._wigle_gps)
 
     def _get_gps_for_mac(self, mac: str) -> tuple[float, float, float, float]:
-        """Get GPS bounds for a MAC address. Returns (min_lat, min_lon, max_lat, max_lon)."""
+        """Get GPS position for a MAC address.
+
+        Returns (centroid_lat, centroid_lon, max_lat, max_lon).
+        The first two values are the signal-weighted centroid (estimated
+        device position), the last two are the bounding box max for
+        coverage area estimation.
+        """
         gps = self._wigle_gps.get(mac.lower())
         if gps:
-            return gps['min_lat'], gps['min_lon'], gps['max_lat'], gps['max_lon']
+            return gps['centroid_lat'], gps['centroid_lon'], gps['max_lat'], gps['max_lon']
         return 0, 0, 0, 0
 
     # ---- CaptureReader Protocol Implementation ----
@@ -1177,35 +1211,32 @@ class PcapReader:
         return pd.DataFrame(records)
 
     def get_gps_data(self) -> pd.DataFrame:
-        """GPS data from companion WiGLE CSV files."""
+        """GPS data from companion WiGLE CSV files (signal-weighted centroids)."""
         if not self._wigle_gps:
             return pd.DataFrame()
 
         records = []
         for mac, gps in self._wigle_gps.items():
-            avg_lat = (gps['min_lat'] + gps['max_lat']) / 2
-            avg_lon = (gps['min_lon'] + gps['max_lon']) / 2
             records.append({
                 'devmac': mac,
-                'lat': avg_lat,
-                'lon': avg_lon,
+                'lat': gps['centroid_lat'],
+                'lon': gps['centroid_lon'],
                 'alt': gps.get('alt', 0),
                 'name': gps.get('ssid', ''),
             })
         return pd.DataFrame(records)
 
     def get_device_gps_track(self, devmac: str) -> pd.DataFrame:
-        """GPS bounds from companion WiGLE data (no true track)."""
+        """GPS centroid + bounds from companion WiGLE data."""
         gps = self._wigle_gps.get(devmac.lower())
         if not gps:
             return pd.DataFrame()
 
-        records = []
+        records = [{'lat': gps['centroid_lat'], 'lon': gps['centroid_lon'], 'alt': gps.get('alt', 0)}]
+        # Include bounds if the device was seen from multiple positions
         if gps['min_lat'] != gps['max_lat'] or gps['min_lon'] != gps['max_lon']:
             records.append({'lat': gps['min_lat'], 'lon': gps['min_lon'], 'alt': gps.get('alt', 0)})
             records.append({'lat': gps['max_lat'], 'lon': gps['max_lon'], 'alt': gps.get('alt', 0)})
-        else:
-            records.append({'lat': gps['min_lat'], 'lon': gps['min_lon'], 'alt': gps.get('alt', 0)})
         return pd.DataFrame(records)
 
     def get_data_sources(self) -> pd.DataFrame:

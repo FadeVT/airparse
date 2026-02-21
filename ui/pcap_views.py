@@ -945,8 +945,29 @@ class DeauthView(QWidget):
                 benign_mask = df_sorted['category'].isin(['Band Steering', 'Client Departure'])
                 attack_mask = ~benign_mask
 
-                if len(df_sorted) <= 50:
-                    # Sparse data: scatter plot — individual event markers
+                # Determine if data is temporally sparse — use scatter if
+                # few events OR if events are clustered with large gaps
+                use_scatter = len(df_sorted) <= 50
+                if not use_scatter and len(df_sorted) > 1:
+                    # Check for large temporal gaps that make bar charts unreadable
+                    sorted_ts = np.sort(ts_series.values.astype(float))
+                    gaps = np.diff(sorted_ts)
+                    if len(gaps) > 0:
+                        max_gap = gaps.max()
+                        median_gap = np.median(gaps) if len(gaps) > 1 else gaps[0]
+                        # If the biggest gap is >50x the median, data has huge holes
+                        if median_gap > 0 and max_gap > median_gap * 50:
+                            use_scatter = True
+                        # Also catch case where total span dwarfs activity
+                        elif duration > 3600 and len(df_sorted) < 200:
+                            active_span = sorted_ts[-1] - sorted_ts[0]
+                            if active_span > 0:
+                                density = len(df_sorted) / (active_span / 60)
+                                if density < 0.5:  # Less than 1 event per 2 minutes
+                                    use_scatter = True
+
+                if use_scatter:
+                    # Scatter plot — individual event markers
                     benign_ts = ts_series[benign_mask].values.astype(float)
                     attack_ts = ts_series[attack_mask].values.astype(float)
 
