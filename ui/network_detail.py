@@ -70,7 +70,7 @@ class NetworkDetailDialog(QDialog):
         """Create the header with SSID name."""
         header = QFrame()
         header.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
-        header.setStyleSheet("background-color: #f5f5f5; padding: 10px;")
+        header.setStyleSheet("background-color: #2b2b2b; padding: 10px;")
 
         layout = QVBoxLayout(header)
 
@@ -88,7 +88,7 @@ class NetworkDetailDialog(QDialog):
         # AP count
         ap_count = self.network_data.get('ap_count', 0)
         count_label = QLabel(f"Access Points: {ap_count}")
-        count_label.setStyleSheet("color: #666;")
+        count_label.setStyleSheet("color: #999;")
         layout.addWidget(count_label)
 
         return header

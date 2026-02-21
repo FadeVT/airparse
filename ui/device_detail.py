@@ -81,7 +81,7 @@ class DeviceDetailDialog(QDialog):
         """Create the header with device MAC."""
         header = QFrame()
         header.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
-        header.setStyleSheet("background-color: #f5f5f5; padding: 10px;")
+        header.setStyleSheet("background-color: #2b2b2b; padding: 10px;")
 
         layout = QVBoxLayout(header)
 
@@ -103,14 +103,14 @@ class DeviceDetailDialog(QDialog):
             manufacturer += " (Randomized MAC)"
 
         manuf_label = QLabel(f"Manufacturer: {manufacturer}")
-        manuf_label.setStyleSheet("color: #666;")
+        manuf_label.setStyleSheet("color: #999;")
         layout.addWidget(manuf_label)
 
         # Device name/SSID if available
         name = self.device_data.get('name', '') or self.device_data.get('ssid', '')
         if name and name != '-':
             name_label = QLabel(f"Name: {name}")
-            name_label.setStyleSheet("color: #333; font-size: 14px;")
+            name_label.setStyleSheet("color: #ccc; font-size: 14px;")
             layout.addWidget(name_label)
 
         return header
@@ -254,7 +254,7 @@ class DeviceDetailDialog(QDialog):
 
             # Count label
             count_label = QLabel(f"Total: {clients_table.rowCount()} client(s)")
-            count_label.setStyleSheet("color: #666; margin-top: 5px;")
+            count_label.setStyleSheet("color: #999; margin-top: 5px;")
             layout.addWidget(count_label)
         else:
             no_clients = QLabel("No associated clients found for this access point.")

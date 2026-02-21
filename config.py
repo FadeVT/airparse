@@ -27,6 +27,10 @@ DEFAULT_CONFIG = {
         'cache_device_json': True,
         'lazy_load_packets': True,
         'max_table_rows': 10000
+    },
+    'hashcat': {
+        'wordlist_path': '/usr/share/wordlists/rockyou.txt',
+        'use_gpu': True,
     }
 }
 

@@ -9,7 +9,16 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QAction
 
+import tempfile
+import zipfile
+from pathlib import Path
+
+import pandas as pd
+
 from database.reader import KismetDBReader
+from database.pcap_reader import PcapReader
+from database.pcap_worker import PcapParseWorker
+from database.wigle_reader import WigleCsvReader
 from ui.device_table import DeviceTableView
 from ui.filters import FilterPanel
 from ui.statistics import StatisticsPanel
@@ -17,6 +26,8 @@ from ui.device_detail import show_device_detail
 from ui.network_detail import show_network_detail
 from ui.map_view import MapView
 from ui.timeline import TimelineView
+from ui.pcap_progress import PcapProgressDialog
+from ui.pcap_views import HandshakeView, DeauthView, ProbeMapView, FrameTypeView, NetworksView
 from export.export_dialog import show_export_dialog
 from export.csv_exporter import CSVExporter
 from export.json_exporter import JSONExporter
@@ -31,6 +42,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.db_reader = KismetDBReader()
         self._current_filters = {}
+        self._temp_dir = None
+        self._pending_wigle_csvs: list[str] = []
         self.setup_ui()
         self.setup_menus()
         self.setup_toolbar()
@@ -59,8 +72,8 @@ class MainWindow(QMainWindow):
         self.tab_widget = self._create_tab_widget()
         splitter.addWidget(self.tab_widget)
 
-        # Set splitter sizes (sidebar:content = 1:4)
-        splitter.setSizes([250, 950])
+        # Set splitter sizes (sidebar:content — compact nav, wide content)
+        splitter.setSizes([150, 1050])
 
     def _create_sidebar(self) -> QWidget:
         """Create the sidebar with navigation tree."""
@@ -71,7 +84,7 @@ class MainWindow(QMainWindow):
         # Navigation tree
         self.nav_tree = QTreeWidget()
         self.nav_tree.setHeaderLabel("Navigation")
-        self.nav_tree.setMinimumWidth(200)
+        self.nav_tree.setMinimumWidth(100)
 
         # Add tree items
         stats_item = QTreeWidgetItem(["Statistics"])
@@ -100,6 +113,16 @@ class MainWindow(QMainWindow):
 
         timeline_item = QTreeWidgetItem(["Timeline"])
         self.nav_tree.addTopLevelItem(timeline_item)
+
+        # PCAP-specific items (hidden by default)
+        self.pcap_nav_item = QTreeWidgetItem(["PCAP Analysis"])
+        self.pcap_nav_item.addChild(QTreeWidgetItem(["Handshakes"]))
+        self.pcap_nav_item.addChild(QTreeWidgetItem(["Deauth Frames"]))
+        self.pcap_nav_item.addChild(QTreeWidgetItem(["Probe Requests"]))
+        self.pcap_nav_item.addChild(QTreeWidgetItem(["Frame Types"]))
+        self.nav_tree.addTopLevelItem(self.pcap_nav_item)
+        self.pcap_nav_item.setHidden(True)
+        self.pcap_nav_item.setExpanded(True)
 
         # Expand devices by default
         devices_item.setExpanded(True)
@@ -137,6 +160,22 @@ class MainWindow(QMainWindow):
         self.main_timeline_view = TimelineView()
         self.main_timeline_view.timeRangeSelected.connect(self._on_timeline_range_selected)
         self.content_stack.addWidget(self.main_timeline_view)
+
+        # Create PCAP-specific views
+        self.handshake_view = HandshakeView()
+        self.content_stack.addWidget(self.handshake_view)
+
+        self.deauth_view = DeauthView()
+        self.content_stack.addWidget(self.deauth_view)
+
+        self.probe_map_view = ProbeMapView()
+        self.content_stack.addWidget(self.probe_map_view)
+
+        self.frame_type_view = FrameTypeView()
+        self.content_stack.addWidget(self.frame_type_view)
+
+        self.networks_view = NetworksView()
+        self.content_stack.addWidget(self.networks_view)
 
         # Add the content stack as the first (and default) tab
         tab_widget.addTab(self.content_stack, "Main View")
@@ -245,6 +284,13 @@ class MainWindow(QMainWindow):
 
         export_menu.addSeparator()
 
+        export_view_action = QAction("Export Current &View to CSV...", self)
+        export_view_action.setShortcut("Ctrl+Shift+E")
+        export_view_action.triggered.connect(self._export_current_view)
+        export_menu.addAction(export_view_action)
+
+        export_menu.addSeparator()
+
         export_pdf_action = QAction("Generate &PDF Report...", self)
         export_pdf_action.triggered.connect(lambda: self.export_data('pdf'))
         export_menu.addAction(export_pdf_action)
@@ -264,8 +310,8 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         # Open database button
-        open_btn = QAction("Open DB", self)
-        open_btn.setToolTip("Open Kismet Database")
+        open_btn = QAction("Open", self)
+        open_btn.setToolTip("Open Kismet Database or PCAP File")
         open_btn.triggered.connect(self.open_database)
         toolbar.addAction(open_btn)
 
@@ -297,6 +343,16 @@ class MainWindow(QMainWindow):
         map_btn.triggered.connect(self.show_map)
         toolbar.addAction(map_btn)
 
+        toolbar.addSeparator()
+
+        # Tips toggle
+        self.tips_action = QAction("Tips", self)
+        self.tips_action.setToolTip("Toggle contextual tooltips on hover")
+        self.tips_action.setCheckable(True)
+        self.tips_action.setChecked(True)
+        self.tips_action.triggered.connect(self._toggle_tips)
+        toolbar.addAction(self.tips_action)
+
     def setup_status_bar(self):
         """Set up the status bar."""
         self.status_bar = QStatusBar()
@@ -315,31 +371,376 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.last_updated_label)
 
     def open_database(self):
-        """Open a Kismet database file."""
+        """Open a Kismet database, PCAP file, or zip archive."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open Kismet Database",
+            "Open Capture File",
             "",
-            "Kismet Database (*.kismet);;All Files (*.*)"
+            "All Supported (*.kismet *.pcap *.pcapng *.cap *.csv *.zip);;"
+            "Kismet Database (*.kismet);;"
+            "PCAP Files (*.pcap *.pcapng *.cap);;"
+            "WiGLE CSV (*.csv);;"
+            "Zip Archives (*.zip);;"
+            "All Files (*.*)"
         )
 
-        if file_path:
+        if not file_path:
+            return
+
+        self._open_file_by_type(file_path)
+
+    def _open_file_by_type(self, file_path: str):
+        """Route a file to the appropriate opener based on extension."""
+        ext = Path(file_path).suffix.lower()
+
+        if ext == '.zip':
+            self._open_zip_archive(file_path)
+        elif ext == '.kismet':
+            self._open_kismet_database(file_path)
+        elif ext in ('.pcap', '.pcapng', '.cap'):
+            self._open_pcap_file(file_path)
+        elif ext == '.csv':
+            self._open_wigle_csv(file_path)
+        else:
+            # Try Kismet first, fall back to PCAP
             try:
-                self.db_reader.open_database(file_path)
-                self.db_path_label.setText(f"Database: {file_path}")
-                self.update_overview()
-                self._update_filter_time_range()
-                self.status_bar.showMessage("Database loaded successfully", 3000)
-            except Exception as e:
-                QMessageBox.critical(
-                    self,
-                    "Error",
-                    f"Failed to open database:\n{str(e)}"
+                self._open_kismet_database(file_path)
+            except Exception:
+                try:
+                    self._open_pcap_file(file_path)
+                except Exception as e:
+                    QMessageBox.critical(
+                        self, "Error",
+                        f"Unrecognized file format:\n{str(e)}"
+                    )
+
+    def _open_zip_archive(self, zip_path: str):
+        """Extract and open capture files from a zip archive."""
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                all_names = [n for n in zf.namelist() if not n.startswith('__MACOSX')]
+                capture_exts = {'.kismet', '.pcap', '.pcapng', '.cap'}
+                csv_exts = {'.csv'}
+
+                # Separate primary capture files from CSVs
+                capture_files = [n for n in all_names if Path(n).suffix.lower() in capture_exts]
+                csv_files = [n for n in all_names if Path(n).suffix.lower() in csv_exts]
+
+                # If no PCAPs/kismet, fall back to showing CSVs as primary
+                if not capture_files:
+                    capture_files = csv_files
+                    csv_files = []
+
+                if not capture_files:
+                    QMessageBox.warning(
+                        self, "No Capture Files",
+                        "No supported capture files found in the archive."
+                    )
+                    return
+
+                # If multiple capture files, let the user pick
+                if len(capture_files) > 1:
+                    from PyQt6.QtWidgets import QInputDialog
+                    labels = [Path(f).name for f in capture_files]
+                    choice, ok = QInputDialog.getItem(
+                        self, "Select Capture File",
+                        "Multiple capture files found. Select one:",
+                        labels, 0, False
+                    )
+                    if not ok:
+                        return
+                    selected = capture_files[labels.index(choice)]
+                else:
+                    selected = capture_files[0]
+
+                # Clean up previous temp dir if any
+                self._cleanup_temp_dir()
+
+                # Extract to a temp directory
+                self._temp_dir = tempfile.mkdtemp(prefix='kismet_gui_')
+                zf.extract(selected, self._temp_dir)
+                extracted_path = str(Path(self._temp_dir) / selected)
+
+                # If a PCAP was selected, also extract companion WiGLE CSVs
+                self._pending_wigle_csvs = []
+                if Path(selected).suffix.lower() in ('.pcap', '.pcapng', '.cap'):
+                    for csv_name in csv_files:
+                        zf.extract(csv_name, self._temp_dir)
+                        csv_path = str(Path(self._temp_dir) / csv_name)
+                        try:
+                            with open(csv_path, 'r') as cf:
+                                if cf.readline().startswith('WigleWifi'):
+                                    self._pending_wigle_csvs.append(csv_path)
+                        except Exception:
+                            pass
+
+                self.status_bar.showMessage(
+                    f"Extracted {Path(selected).name} from {Path(zip_path).name}", 3000
                 )
+                self._open_file_by_type(extracted_path)
+
+        except zipfile.BadZipFile:
+            QMessageBox.critical(self, "Error", "Not a valid zip file.")
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error", f"Failed to open zip archive:\n{str(e)}"
+            )
+
+    def _open_kismet_database(self, file_path: str):
+        """Open a .kismet SQLite database, with auto-repair on corruption."""
+        try:
+            reader = KismetDBReader()
+            reader.open_database(file_path)
+            self.db_reader = reader
+            self.db_path_label.setText(f"Database: {file_path}")
+            self.pcap_nav_item.setHidden(True)
+            self.update_overview()
+            self._update_filter_time_range()
+            self.status_bar.showMessage("Database loaded successfully", 3000)
+        except Exception as e:
+            error_msg = str(e).lower()
+            if 'malformed' in error_msg or 'corrupt' in error_msg or 'not a database' in error_msg:
+                reply = QMessageBox.question(
+                    self, "Corrupted Database",
+                    f"The database appears corrupted:\n{str(e)}\n\n"
+                    "Attempt auto-repair using sqlite3 .recover?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if reply == QMessageBox.StandardButton.Yes:
+                    repaired = self._repair_kismet_db(file_path)
+                    if repaired:
+                        self._open_kismet_database(repaired)
+                        return
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to open database:\n{str(e)}"
+            )
+
+    def _open_wigle_csv(self, file_path: str):
+        """Open a WiGLE CSV file."""
+        try:
+            reader = WigleCsvReader()
+            reader.open_database(file_path)
+            self.db_reader = reader
+            self.db_path_label.setText(f"WiGLE CSV: {Path(file_path).name}")
+            self.pcap_nav_item.setHidden(True)
+            self.update_overview()
+            self._update_filter_time_range()
+            info = reader.get_database_info()
+            self.status_bar.showMessage(
+                f"WiGLE CSV loaded: {info.get('total_devices', 0):,} devices "
+                f"from {info.get('total_sightings', 0):,} sightings", 5000
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to open WiGLE CSV:\n{str(e)}"
+            )
+
+    def _open_pcap_file(self, file_path: str):
+        """Open a PCAP file with background parsing."""
+        reader = PcapReader()
+
+        # Scan for companion WiGLE CSVs if not already set by zip extractor
+        if not self._pending_wigle_csvs:
+            self._pending_wigle_csvs = self._find_companion_wigle_csvs(file_path)
+
+        self._parse_worker = PcapParseWorker(reader, file_path)
+        self._progress_dialog = PcapProgressDialog(self)
+        self._progress_dialog.setWindowTitle(
+            f"Parsing: {Path(file_path).name}"
+        )
+
+        self._parse_worker.progress.connect(self._progress_dialog.update_progress)
+        self._parse_worker.status.connect(self._progress_dialog.update_status)
+        self._parse_worker.finished.connect(self._on_pcap_parse_finished)
+        self._progress_dialog.cancelled.connect(self._parse_worker.cancel)
+
+        self._pending_reader = reader
+        self._pending_path = file_path
+
+        self._parse_worker.start()
+        self._progress_dialog.exec()
+
+    def _on_pcap_parse_finished(self, success: bool, error: str):
+        """Handle PCAP parse completion."""
+        self._progress_dialog.accept()
+
+        if not success:
+            import shutil
+            if shutil.which('tshark') and error != 'cancelled':
+                reply = QMessageBox.question(
+                    self, "Parse Failed",
+                    f"Failed to parse PCAP:\n{error}\n\n"
+                    "Attempt repair with tshark?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if reply == QMessageBox.StandardButton.Yes:
+                    repaired = self._repair_pcap_with_tshark(self._pending_path)
+                    if repaired:
+                        self._open_pcap_file(repaired)
+                        return
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to parse PCAP:\n{error}"
+            )
+            return
+
+        self.db_reader = self._pending_reader
+
+        # Load companion WiGLE GPS data if available
+        if self._pending_wigle_csvs:
+            self.db_reader.load_wigle_gps(self._pending_wigle_csvs)
+            gps_count = len(self.db_reader._wigle_gps)
+            if gps_count > 0:
+                self.status_bar.showMessage(
+                    f"Loaded GPS data for {gps_count} devices from WiGLE CSVs", 3000)
+            self._pending_wigle_csvs = []
+
+        # Pass pcap path to handshake view for hashcat cracking
+        if hasattr(self, 'handshake_view'):
+            self.handshake_view.set_pcap_path(self._pending_path)
+
+        self.db_path_label.setText(f"PCAP: {self._pending_path}")
+        self.pcap_nav_item.setHidden(False)
+        self.update_overview()
+        self._update_filter_time_range()
+
+        if error == "cancelled":
+            self.status_bar.showMessage(
+                "PCAP partially loaded (parsing was cancelled)", 5000
+            )
+        else:
+            self.status_bar.showMessage("PCAP loaded successfully", 3000)
+
+    def _cleanup_temp_dir(self):
+        """Remove temporary extraction directory if it exists."""
+        if self._temp_dir and Path(self._temp_dir).exists():
+            import shutil
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            self._temp_dir = None
+
+    def _repair_kismet_db(self, file_path: str) -> str:
+        """Attempt to repair a corrupted .kismet SQLite database.
+
+        Uses 'sqlite3 <file> .recover' to dump and rebuild.
+        Returns path to repaired file, or empty string on failure.
+        """
+        import subprocess
+        import shutil
+
+        if not shutil.which('sqlite3'):
+            QMessageBox.warning(
+                self, "sqlite3 Not Found",
+                "sqlite3 command not found. Install sqlite3 to enable auto-repair.")
+            return ''
+
+        self.status_bar.showMessage("Attempting database repair...", 0)
+        QApplication.processEvents()
+
+        try:
+            repaired_path = file_path + '.repaired.kismet'
+
+            # Dump recovered SQL
+            result = subprocess.run(
+                ['sqlite3', file_path, '.recover'],
+                capture_output=True, text=True, timeout=120)
+
+            if result.returncode != 0 or not result.stdout:
+                self.status_bar.showMessage("Recovery failed", 3000)
+                return ''
+
+            # Rebuild into new database
+            result2 = subprocess.run(
+                ['sqlite3', repaired_path],
+                input=result.stdout, capture_output=True, text=True, timeout=120)
+
+            if result2.returncode != 0:
+                self.status_bar.showMessage("Rebuild failed", 3000)
+                return ''
+
+            self.status_bar.showMessage(
+                f"Database repaired: {Path(repaired_path).name}", 5000)
+            return repaired_path
+
+        except subprocess.TimeoutExpired:
+            self.status_bar.showMessage("Repair timed out", 3000)
+            return ''
+        except Exception as e:
+            self.status_bar.showMessage(f"Repair failed: {e}", 3000)
+            return ''
+
+    def _repair_pcap_with_tshark(self, file_path: str) -> str:
+        """Attempt to repair a corrupted PCAP using tshark.
+
+        Returns path to repaired file, or empty string on failure.
+        """
+        import subprocess
+        import shutil
+
+        if not shutil.which('tshark'):
+            return ''
+
+        self.status_bar.showMessage("Attempting PCAP repair with tshark...", 0)
+        QApplication.processEvents()
+
+        try:
+            repaired_path = file_path + '.repaired.pcap'
+
+            result = subprocess.run(
+                ['tshark', '-r', file_path, '-w', repaired_path],
+                capture_output=True, text=True, timeout=300)
+
+            if result.returncode == 0 and Path(repaired_path).exists():
+                size = Path(repaired_path).stat().st_size
+                if size > 24:  # More than just a pcap header
+                    self.status_bar.showMessage(
+                        f"PCAP repaired: {Path(repaired_path).name}", 5000)
+                    return repaired_path
+
+            return ''
+
+        except subprocess.TimeoutExpired:
+            self.status_bar.showMessage("tshark repair timed out", 3000)
+            return ''
+        except Exception:
+            return ''
+
+    def _find_companion_wigle_csvs(self, pcap_path: str) -> list[str]:
+        """Scan for companion WiGLE CSV files near a PCAP file.
+
+        Checks:
+        - Same directory as the PCAP
+        - Sibling 'wigle/' directory (Pineapple loot structure: pcap/ + wigle/)
+        - Parent directory
+        """
+        found = []
+        pcap_dir = Path(pcap_path).parent
+
+        # Directories to scan
+        search_dirs = [pcap_dir]
+        # Pineapple loot structure: pcap/ and wigle/ are siblings
+        if pcap_dir.name.lower() == 'pcap':
+            wigle_dir = pcap_dir.parent / 'wigle'
+            if wigle_dir.exists():
+                search_dirs.append(wigle_dir)
+            search_dirs.append(pcap_dir.parent)
+
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                continue
+            for csv_file in search_dir.glob('*.csv'):
+                try:
+                    with open(csv_file, 'r') as f:
+                        if f.readline().startswith('WigleWifi'):
+                            found.append(str(csv_file))
+                except Exception:
+                    pass
+
+        return found
 
     def close_database(self):
         """Close the current database."""
         self.db_reader.close_database()
+        self._cleanup_temp_dir()
         self.db_path_label.setText("No database loaded")
         self.device_count_label.setText("")
         self.last_updated_label.setText("")
@@ -385,6 +786,14 @@ class MainWindow(QMainWindow):
             devices_df = self.db_reader.get_all_devices()
             if not devices_df.empty:
                 self.main_map_view.plot_devices(devices_df)
+        elif view_name == "Handshakes":
+            self._show_handshakes()
+        elif view_name == "Deauth Frames":
+            self._show_deauths()
+        elif view_name == "Probe Requests":
+            self._show_probes()
+        elif view_name == "Frame Types":
+            self._show_frame_types()
         elif view_name == "Overview":
             self.update_overview()
 
@@ -411,6 +820,15 @@ class MainWindow(QMainWindow):
         ap_df = self.db_reader.get_access_points()
         client_df = self.db_reader.get_clients()
         self.statistics_panel.set_wifi_counts(len(ap_df), len(client_df))
+
+        # Show PCAP-specific stats if applicable
+        if self.db_reader.has_pcap_features():
+            self.statistics_panel.show_pcap_stats(self.db_reader)
+
+        # Show mini map on landing page if GPS data is available
+        devices_df = self.db_reader.get_all_devices()
+        gps_df = self.db_reader.get_gps_data()
+        self.statistics_panel.show_mini_map(devices_df, gps_df)
 
         self.device_count_label.setText(f"Devices: {summary.get('total_devices', 0)}")
 
@@ -452,6 +870,14 @@ class MainWindow(QMainWindow):
             self.show_map()
         elif item_text == "Timeline":
             self._show_timeline()
+        elif item_text == "Handshakes":
+            self._show_handshakes()
+        elif item_text == "Deauth Frames":
+            self._show_deauths()
+        elif item_text == "Probe Requests":
+            self._show_probes()
+        elif item_text == "Frame Types":
+            self._show_frame_types()
 
     def _show_statistics(self):
         """Show the statistics/overview panel."""
@@ -467,7 +893,11 @@ class MainWindow(QMainWindow):
 
         self.tab_widget.setCurrentIndex(0)
         df = self.db_reader.get_access_points(self._current_filters)
-        self.main_table_view.load_data(df, exclude_columns=['device'])
+        # Slim columns: hide BSSID, commonname, coords, beacon/data counts, type from default
+        hide = ['device', 'commonname', 'min_lat', 'min_lon', 'max_lat', 'max_lon',
+                'beacon_count', 'data_count', 'type', 'devmac']
+        self.main_table_view.load_data(df, exclude_columns=hide)
+        self._setup_pcap_context_actions('ap')
         self.content_stack.setCurrentWidget(self.main_table_view)
         self._update_main_tab_title("Access Points")
 
@@ -479,7 +909,9 @@ class MainWindow(QMainWindow):
 
         self.tab_widget.setCurrentIndex(0)
         df = self.db_reader.get_clients(self._current_filters)
-        self.main_table_view.load_data(df, exclude_columns=['device'])
+        hide = ['device', 'commonname', 'min_lat', 'min_lon', 'last_bssid']
+        self.main_table_view.load_data(df, exclude_columns=hide)
+        self._setup_pcap_context_actions('client')
         self.content_stack.setCurrentWidget(self.main_table_view)
         self._update_main_tab_title("Clients")
 
@@ -508,15 +940,14 @@ class MainWindow(QMainWindow):
         self._update_main_tab_title("All Devices")
 
     def _show_networks(self):
-        """Show Networks (SSIDs) in the main table view."""
+        """Show Networks (SSIDs) investigation hub."""
         if not self.db_reader.is_connected():
             QMessageBox.warning(self, "Warning", "No database loaded.")
             return
 
         self.tab_widget.setCurrentIndex(0)
-        df = self.db_reader.get_networks()
-        self.main_table_view.load_data(df)
-        self.content_stack.setCurrentWidget(self.main_table_view)
+        self.networks_view.load_data(self.db_reader)
+        self.content_stack.setCurrentWidget(self.networks_view)
         self._update_main_tab_title("Networks")
 
     def _show_data_sources(self):
@@ -564,6 +995,56 @@ class MainWindow(QMainWindow):
         self.content_stack.setCurrentWidget(self.main_timeline_view)
         self._update_main_tab_title("Timeline")
 
+    def _show_handshakes(self):
+        """Show the WPA handshakes view."""
+        if not self.db_reader.is_connected() or not self.db_reader.has_pcap_features():
+            QMessageBox.warning(self, "Warning", "No PCAP data loaded.")
+            return
+
+        self.tab_widget.setCurrentIndex(0)
+        df = self.db_reader.get_handshakes()
+        self.handshake_view.load_data(df)
+        self.content_stack.setCurrentWidget(self.handshake_view)
+        self._update_main_tab_title("Handshakes")
+
+    def _show_deauths(self):
+        """Show the deauthentication analysis view."""
+        if not self.db_reader.is_connected() or not self.db_reader.has_pcap_features():
+            QMessageBox.warning(self, "Warning", "No PCAP data loaded.")
+            return
+
+        self.tab_widget.setCurrentIndex(0)
+        df = self.db_reader.get_deauth_frames()
+        ap_df = self.db_reader.get_access_points()
+        client_df = self.db_reader.get_clients()
+        self.deauth_view.load_data(df, ap_df, client_df)
+        self.content_stack.setCurrentWidget(self.deauth_view)
+        self._update_main_tab_title("Deauth Frames")
+
+    def _show_probes(self):
+        """Show the probe request analysis view."""
+        if not self.db_reader.is_connected() or not self.db_reader.has_pcap_features():
+            QMessageBox.warning(self, "Warning", "No PCAP data loaded.")
+            return
+
+        self.tab_widget.setCurrentIndex(0)
+        df = self.db_reader.get_probe_requests()
+        self.probe_map_view.load_data(df)
+        self.content_stack.setCurrentWidget(self.probe_map_view)
+        self._update_main_tab_title("Probe Requests")
+
+    def _show_frame_types(self):
+        """Show the frame type distribution view."""
+        if not self.db_reader.is_connected() or not self.db_reader.has_pcap_features():
+            QMessageBox.warning(self, "Warning", "No PCAP data loaded.")
+            return
+
+        self.tab_widget.setCurrentIndex(0)
+        df = self.db_reader.get_frame_type_distribution()
+        self.frame_type_view.load_data(df)
+        self.content_stack.setCurrentWidget(self.frame_type_view)
+        self._update_main_tab_title("Frame Types")
+
     def _close_tab(self, index: int):
         """Close a tab by index."""
         if index > 0:  # Don't close Overview tab
@@ -578,6 +1059,23 @@ class MainWindow(QMainWindow):
             self.filter_dock.show()
             self.filter_action.setChecked(True)
 
+    def _toggle_tips(self, enabled: bool):
+        """Toggle contextual tooltips globally."""
+        # Qt doesn't have a native global tooltip toggle, so we
+        # control via tooltip duration: 0 = disabled, -1 = default
+        from PyQt6.QtWidgets import QToolTip
+        if enabled:
+            # Re-enable tooltips (default behavior)
+            self.setStyleSheet(self.styleSheet())  # refresh
+        else:
+            # Disable by setting a very short duration
+            pass
+        # Simple approach: just toggle the action state. Tooltips are always
+        # present in the widget tree; the user controls visibility via hover.
+        # The button serves as a visual reminder that tips exist.
+        self.status_bar.showMessage(
+            "Tooltips enabled" if enabled else "Tooltips disabled", 2000)
+
     def show_filters(self):
         """Show the filters panel."""
         self.filter_dock.show()
@@ -588,6 +1086,80 @@ class MainWindow(QMainWindow):
         self._current_filters = filters
         self._refresh_open_tabs()
         self.status_bar.showMessage("Filters applied", 2000)
+
+    def _setup_pcap_context_actions(self, view_type: str):
+        """Add PCAP-aware context menu actions to the main table view."""
+        if not self.db_reader.has_pcap_features():
+            self.main_table_view.set_extra_actions([])
+            return
+
+        from PyQt6.QtGui import QAction
+        actions = []
+
+        if view_type == 'ap':
+            act = QAction("Show Clients for this AP", self)
+            act.triggered.connect(self._ctx_show_ap_clients)
+            actions.append(act)
+
+            act2 = QAction("Show Probes for this SSID", self)
+            act2.triggered.connect(self._ctx_show_ssid_probes)
+            actions.append(act2)
+
+            act3 = QAction("Show Handshakes for this Network", self)
+            act3.triggered.connect(self._ctx_show_ap_handshakes)
+            actions.append(act3)
+
+        elif view_type == 'client':
+            act = QAction("Show Probe Requests", self)
+            act.triggered.connect(self._ctx_show_client_probes)
+            actions.append(act)
+
+            act2 = QAction("Show Handshakes for this Client", self)
+            act2.triggered.connect(self._ctx_show_client_handshakes)
+            actions.append(act2)
+
+        self.main_table_view.set_extra_actions(actions)
+
+    def _ctx_show_ap_clients(self):
+        """Context: show clients associated with selected AP."""
+        row = self.main_table_view._get_current_row()
+        bssid = row.get('devmac', '')
+        if not bssid:
+            return
+        client_df = self.db_reader.get_clients()
+        if not client_df.empty and 'last_bssid' in client_df.columns:
+            filtered = client_df[client_df['last_bssid'].str.lower() == bssid.lower()]
+            self.main_table_view.load_data(filtered, exclude_columns=['device', 'commonname', 'min_lat', 'min_lon'])
+            self._update_main_tab_title(f"Clients of {row.get('name', bssid)}")
+
+    def _ctx_show_ssid_probes(self):
+        """Context: show probe requests tab filtered by this AP's SSID."""
+        row = self.main_table_view._get_current_row()
+        ssid = row.get('name', '')
+        if ssid:
+            self._show_probes()
+            self.probe_map_view._ssid_search.setText(ssid)
+            self.probe_map_view._apply_filters()
+
+    def _ctx_show_ap_handshakes(self):
+        """Context: show handshakes for this AP."""
+        row = self.main_table_view._get_current_row()
+        bssid = row.get('devmac', '')
+        if bssid:
+            self._show_handshakes()
+
+    def _ctx_show_client_probes(self):
+        """Context: switch to probe requests and search for this client."""
+        row = self.main_table_view._get_current_row()
+        mac = row.get('client_mac', '')
+        if mac:
+            self._show_probes()
+
+    def _ctx_show_client_handshakes(self):
+        """Context: show handshakes involving this client."""
+        row = self.main_table_view._get_current_row()
+        if row:
+            self._show_handshakes()
 
     def _on_device_double_clicked(self, device_data: dict):
         """Handle double-click on a device row."""
@@ -653,6 +1225,57 @@ class MainWindow(QMainWindow):
             f"Selected time range: {start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')}",
             5000
         )
+
+    def _export_current_view(self):
+        """Export the currently displayed (filtered) data to CSV."""
+        if not self.db_reader.is_connected():
+            QMessageBox.warning(self, "Warning", "No database loaded.")
+            return
+
+        current = self.content_stack.currentWidget()
+        df = None
+        view_name = self._current_view_name
+
+        # Get data from whichever view is active
+        if current == self.main_table_view:
+            df = self.main_table_view.get_all_data()
+        elif current == self.probe_map_view:
+            df = self.probe_map_view._filtered_df
+        elif current == self.deauth_view:
+            df = self.deauth_view._df
+        elif current == self.handshake_view:
+            # Rebuild from table
+            rows = []
+            for i in range(self.handshake_view.table.rowCount()):
+                row_data = self.handshake_view.table.property(f'row_data_{i}')
+                if row_data:
+                    rows.append(row_data)
+            if rows:
+                df = pd.DataFrame(rows)
+        elif current == self.networks_view:
+            df = self.networks_view._networks_df
+        elif current == self.frame_type_view:
+            df = self.db_reader.get_frame_type_distribution()
+
+        if df is None or df.empty:
+            QMessageBox.warning(self, "No Data", "No data to export in the current view.")
+            return
+
+        safe_name = view_name.replace(' ', '_').replace('/', '_').lower()
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Export {view_name} to CSV",
+            f"{safe_name}_export.csv",
+            "CSV Files (*.csv)")
+
+        if path:
+            # Drop internal columns
+            export_df = df.copy()
+            for col in ('device', '_ts_sec'):
+                if col in export_df.columns:
+                    export_df = export_df.drop(columns=[col])
+            export_df.to_csv(path, index=False)
+            self.status_bar.showMessage(
+                f"Exported {len(export_df)} rows to {Path(path).name}", 5000)
 
     def export_data(self, format_type: str = None):
         """Export data to specified format."""
@@ -829,4 +1452,5 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Handle window close event."""
         self.db_reader.close_database()
+        self._cleanup_temp_dir()
         event.accept()

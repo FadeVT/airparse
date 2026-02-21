@@ -224,6 +224,21 @@ class DeviceTableView(QWidget):
         self.export_selected_action.triggered.connect(self._export_selected)
         self.context_menu.addAction(self.export_selected_action)
 
+    def set_extra_actions(self, actions: list):
+        """Set additional context menu actions (e.g., PCAP-specific)."""
+        # Remove old extra actions
+        if hasattr(self, '_extra_actions'):
+            for act in self._extra_actions:
+                self.context_menu.removeAction(act)
+            if hasattr(self, '_extra_separator'):
+                self.context_menu.removeAction(self._extra_separator)
+
+        self._extra_actions = actions
+        if actions:
+            self._extra_separator = self.context_menu.addSeparator()
+            for act in actions:
+                self.context_menu.addAction(act)
+
     def load_data(self, df: pd.DataFrame, exclude_columns: list = None):
         """
         Load data into the table.

@@ -410,6 +410,26 @@ class KismetDBReader:
 
         return query
 
+    def get_handshakes(self) -> pd.DataFrame:
+        """Not available for Kismet databases."""
+        return pd.DataFrame()
+
+    def get_deauth_frames(self) -> pd.DataFrame:
+        """Not available for Kismet databases."""
+        return pd.DataFrame()
+
+    def get_probe_requests(self) -> pd.DataFrame:
+        """Not available for Kismet databases."""
+        return pd.DataFrame()
+
+    def get_frame_type_distribution(self) -> pd.DataFrame:
+        """Not available for Kismet databases."""
+        return pd.DataFrame()
+
+    def has_pcap_features(self) -> bool:
+        """Kismet databases don't have PCAP-specific features."""
+        return False
+
     def execute_raw_query(self, query: str, params: tuple = ()) -> pd.DataFrame:
         """
         Execute a raw SQL query.

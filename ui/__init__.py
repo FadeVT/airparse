@@ -7,6 +7,8 @@ from .statistics import StatisticsPanel
 from .device_detail import DeviceDetailDialog, show_device_detail
 from .map_view import MapView
 from .timeline import TimelineView
+from .pcap_progress import PcapProgressDialog
+from .pcap_views import HandshakeView, DeauthView, ProbeMapView, FrameTypeView
 
 __all__ = [
     'MainWindow',
@@ -17,5 +19,10 @@ __all__ = [
     'DeviceDetailDialog',
     'show_device_detail',
     'MapView',
-    'TimelineView'
+    'TimelineView',
+    'PcapProgressDialog',
+    'HandshakeView',
+    'DeauthView',
+    'ProbeMapView',
+    'FrameTypeView',
 ]

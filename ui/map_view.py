@@ -51,35 +51,45 @@ class MapView(QWidget):
 
         # Map view
         if HAS_WEBENGINE:
-            self.web_view = QWebEngineView()
-            self.web_view.setMinimumSize(400, 300)
-            # Prevent clicks from resizing window
-            self.web_view.setSizePolicy(
-                self.web_view.sizePolicy().horizontalPolicy(),
-                self.web_view.sizePolicy().verticalPolicy()
-            )
-            layout.addWidget(self.web_view, 1)  # stretch factor of 1
+            try:
+                self.web_view = QWebEngineView()
+                self.web_view.setMinimumSize(400, 300)
+                self.web_view.setSizePolicy(
+                    self.web_view.sizePolicy().horizontalPolicy(),
+                    self.web_view.sizePolicy().verticalPolicy()
+                )
+                layout.addWidget(self.web_view, 1)
 
-            # Track if map is ready
-            self._map_ready = False
-            self._pending_devices = None
-            self._pending_track = None
-            self._pending_center = None  # Pending set_center call
+                # Track if map is ready
+                self._map_ready = False
+                self._pending_devices = None
+                self._pending_track = None
+                self._pending_center = None
 
-            # Set up timer to poll for device clicks from JavaScript
-            self._click_poll_timer = QTimer(self)
-            self._click_poll_timer.timeout.connect(self._poll_for_device_click)
-            self._click_poll_timer.start(200)  # Poll every 200ms
+                # Set up timer to poll for device clicks from JavaScript
+                self._click_poll_timer = QTimer(self)
+                self._click_poll_timer.timeout.connect(self._poll_for_device_click)
+                self._click_poll_timer.start(200)
 
-            # Defer map initialization until widget is shown
-            self._first_show = True
+                # Defer map initialization until widget is shown
+                self._first_show = True
+            except Exception:
+                self.web_view = None
+                placeholder = QLabel(
+                    "Map view failed to initialize.\n\n"
+                    "WebEngine may not be compatible with your display server.\n"
+                    "Try setting: QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu"
+                )
+                placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                placeholder.setStyleSheet("background-color: #2b2b2b; color: #ccc; padding: 50px;")
+                layout.addWidget(placeholder)
         else:
             placeholder = QLabel(
                 "PyQt6-WebEngine is required for map view.\n\n"
                 "Install with: pip install PyQt6-WebEngine"
             )
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            placeholder.setStyleSheet("background-color: #f5f5f5; padding: 50px;")
+            placeholder.setStyleSheet("background-color: #2b2b2b; color: #ccc; padding: 50px;")
             layout.addWidget(placeholder)
             self.web_view = None
 
@@ -90,7 +100,7 @@ class MapView(QWidget):
         # Layer selector
         toolbar.addWidget(QLabel("Layer: "))
         self.layer_combo = QComboBox()
-        self.layer_combo.addItems(["OpenStreetMap", "Satellite", "Terrain"])
+        self.layer_combo.addItems(["Dark Matter", "Dark (No Labels)", "Satellite", "Terrain"])
         self.layer_combo.currentTextChanged.connect(self._on_layer_changed)
         toolbar.addWidget(self.layer_combo)
 
@@ -166,9 +176,14 @@ class MapView(QWidget):
 
     def _on_map_loaded(self, ok: bool):
         """Handle map page load completion."""
-        if ok:
-            self._map_ready = True
+        if not ok:
+            # Page failed to load — CDN resources might be unavailable
+            self._map_ready = False
+            return
 
+        self._map_ready = True
+
+        try:
             # Apply pending center first
             if self._pending_center is not None:
                 lat, lon, zoom = self._pending_center
@@ -185,6 +200,8 @@ class MapView(QWidget):
             # Fit to data after loading
             if self._devices or self._gps_track:
                 self._fit_to_data()
+        except Exception:
+            pass  # Swallow JS errors to prevent crash
 
     def _generate_map_html(self, center_lat: float = 39.8283, center_lon: float = -98.5795,
                            zoom: int = 4) -> str:
@@ -199,17 +216,75 @@ class MapView(QWidget):
     <style>
         * {{ margin: 0; padding: 0; }}
         html, body {{ width: 100vw; height: 100vh; overflow: hidden; }}
-        #map {{ width: 100vw; height: 100vh; }}
-        .device-popup {{ min-width: 200px; }}
-        .device-popup h4 {{ margin: 0 0 8px 0; font-family: monospace; }}
+        #map {{ width: 100vw; height: 100vh; background: #1a1a2e; }}
+
+        /* --- Dark theme for Leaflet controls --- */
+        .leaflet-control-zoom a,
+        .leaflet-control-layers-toggle {{
+            background-color: #2b2b2b !important;
+            color: #e0e0e0 !important;
+            border-color: #444 !important;
+        }}
+        .leaflet-control-zoom a:hover,
+        .leaflet-control-layers-toggle:hover {{
+            background-color: #3c3f41 !important;
+        }}
+        .leaflet-control-layers {{
+            background-color: #2b2b2b !important;
+            color: #e0e0e0 !important;
+            border-color: #444 !important;
+        }}
+        .leaflet-control-layers label {{
+            color: #e0e0e0 !important;
+        }}
+        .leaflet-control-layers-separator {{
+            border-top-color: #444 !important;
+        }}
+        .leaflet-control-attribution {{
+            background-color: rgba(30, 30, 30, 0.7) !important;
+            color: #999 !important;
+        }}
+        .leaflet-control-attribution a {{
+            color: #aaa !important;
+        }}
+
+        /* --- Dark popups --- */
+        .leaflet-popup-content-wrapper {{
+            background-color: #2b2b2b !important;
+            color: #e0e0e0 !important;
+            border-radius: 6px !important;
+        }}
+        .leaflet-popup-tip {{
+            background-color: #2b2b2b !important;
+        }}
+        .leaflet-popup-close-button {{
+            color: #aaa !important;
+        }}
+        .leaflet-popup-close-button:hover {{
+            color: #fff !important;
+        }}
+
+        /* --- Device popup content --- */
+        .device-popup {{ min-width: 200px; color: #e0e0e0; }}
+        .device-popup h4 {{ margin: 0 0 8px 0; font-family: monospace; color: #e0e0e0; }}
         .device-popup table {{ width: 100%; font-size: 12px; }}
-        .device-popup td {{ padding: 2px 4px; }}
+        .device-popup td {{ padding: 2px 4px; color: #ccc; }}
+        .device-popup td b {{ color: #e0e0e0; }}
         .device-popup .view-details {{
             display: block; margin-top: 10px; padding: 5px 10px;
             background: #3498db; color: white; text-align: center;
             text-decoration: none; border-radius: 4px; cursor: pointer;
         }}
         .device-popup .view-details:hover {{ background: #2980b9; }}
+
+        /* --- Cluster markers --- */
+        .marker-cluster div {{
+            background-color: rgba(52, 152, 219, 0.6) !important;
+            color: #fff !important;
+        }}
+        .marker-cluster {{
+            background-color: rgba(52, 152, 219, 0.3) !important;
+        }}
     </style>
 </head>
 <body>
@@ -222,10 +297,17 @@ class MapView(QWidget):
     var map = L.map('map').setView([{center_lat}, {center_lon}], {zoom});
 
     // Tile layers
-    var osmLayer = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-        attribution: '© OpenStreetMap',
-        maxZoom: 19
+    var darkMatterLayer = L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+        attribution: '© OpenStreetMap contributors © CARTO',
+        subdomains: 'abcd',
+        maxZoom: 20
     }}).addTo(map);
+
+    var darkNoLabelsLayer = L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_nolabels/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+        attribution: '© OpenStreetMap contributors © CARTO',
+        subdomains: 'abcd',
+        maxZoom: 20
+    }});
 
     var satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
         attribution: '© Esri',
@@ -237,7 +319,7 @@ class MapView(QWidget):
         maxZoom: 17
     }});
 
-    var currentLayer = osmLayer;
+    var currentLayer = darkMatterLayer;
     var deviceData = [];
     var useClustering = true;
     var clusterGroup = null;
@@ -262,7 +344,8 @@ class MapView(QWidget):
         map.removeLayer(currentLayer);
         if (name === 'Satellite') currentLayer = satelliteLayer;
         else if (name === 'Terrain') currentLayer = terrainLayer;
-        else currentLayer = osmLayer;
+        else if (name === 'Dark (No Labels)') currentLayer = darkNoLabelsLayer;
+        else currentLayer = darkMatterLayer;
         currentLayer.addTo(map);
     }}
 

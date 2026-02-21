@@ -43,7 +43,7 @@ class TimelineView(QWidget):
                 "Install with: pip install pyqtgraph"
             )
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            placeholder.setStyleSheet("background-color: #f5f5f5; padding: 50px;")
+            placeholder.setStyleSheet("background-color: #2b2b2b; color: #ccc; padding: 50px;")
             layout.addWidget(placeholder)
             return
 
@@ -71,7 +71,7 @@ class TimelineView(QWidget):
 
         # Time range info
         self.range_label = QLabel("Time Range: No data loaded")
-        self.range_label.setStyleSheet("padding: 5px; background-color: #f5f5f5;")
+        self.range_label.setStyleSheet("padding: 5px; background-color: #2b2b2b; color: #ccc;")
         layout.addWidget(self.range_label)
 
     def _create_toolbar(self) -> QWidget:
@@ -124,7 +124,7 @@ class TimelineView(QWidget):
         # Create plot with date axis
         date_axis = DateAxisItem(orientation='bottom')
         self.packet_plot = pg.PlotWidget(axisItems={'bottom': date_axis})
-        self.packet_plot.setBackground('w')
+        self.packet_plot.setBackground('#2b2b2b')
         self.packet_plot.setLabel('left', 'Packet Count')
         self.packet_plot.showGrid(x=True, y=True, alpha=0.3)
         self.packet_plot.setMouseEnabled(x=True, y=True)
@@ -156,7 +156,7 @@ class TimelineView(QWidget):
 
         date_axis = DateAxisItem(orientation='bottom')
         self.signal_plot = pg.PlotWidget(axisItems={'bottom': date_axis})
-        self.signal_plot.setBackground('w')
+        self.signal_plot.setBackground('#2b2b2b')
         self.signal_plot.setLabel('left', 'Signal (dBm)')
         self.signal_plot.showGrid(x=True, y=True, alpha=0.3)
         self.signal_plot.setMouseEnabled(x=True, y=True)
@@ -182,7 +182,7 @@ class TimelineView(QWidget):
 
         date_axis = DateAxisItem(orientation='bottom')
         self.device_plot = pg.PlotWidget(axisItems={'bottom': date_axis})
-        self.device_plot.setBackground('w')
+        self.device_plot.setBackground('#2b2b2b')
         self.device_plot.setLabel('left', 'Device Count')
         self.device_plot.showGrid(x=True, y=True, alpha=0.3)
         self.device_plot.setMouseEnabled(x=True, y=True)
