@@ -31,6 +31,7 @@ from ui.timeline import TimelineView
 from ui.pcap_progress import PcapProgressDialog
 from ui.pcap_views import HandshakeView, DeauthView, ProbeMapView, FrameTypeView, NetworksView
 from ui.connect_dialog import ConnectDialog
+from ui.settings_dialog import SettingsDialog
 from export.export_dialog import show_export_dialog
 from export.csv_exporter import CSVExporter
 from export.json_exporter import JSONExporter
@@ -166,6 +167,7 @@ class MainWindow(QMainWindow):
 
         # Create PCAP-specific views
         self.handshake_view = HandshakeView()
+        self.handshake_view.show_on_map.connect(self._on_handshake_show_on_map)
         self.content_stack.addWidget(self.handshake_view)
 
         self.deauth_view = DeauthView()
@@ -270,6 +272,13 @@ class MainWindow(QMainWindow):
         filter_action.triggered.connect(self.show_filters)
         tools_menu.addAction(filter_action)
 
+        tools_menu.addSeparator()
+
+        settings_action = QAction("&Settings...", self)
+        settings_action.setShortcut("Ctrl+,")
+        settings_action.triggered.connect(self._show_settings)
+        tools_menu.addAction(settings_action)
+
         # Export menu
         export_menu = menubar.addMenu("&Export")
 
@@ -312,12 +321,6 @@ class MainWindow(QMainWindow):
         toolbar.setIconSize(QSize(24, 24))
         self.addToolBar(toolbar)
 
-        # Open database button
-        open_btn = QAction("Open", self)
-        open_btn.setToolTip("Open Kismet Database or PCAP File")
-        open_btn.triggered.connect(self.open_database)
-        toolbar.addAction(open_btn)
-
         # Refresh button
         refresh_btn = QAction("Refresh", self)
         refresh_btn.setToolTip("Refresh Data")
@@ -339,22 +342,6 @@ class MainWindow(QMainWindow):
         export_btn.setToolTip("Export Data")
         export_btn.triggered.connect(lambda: self.export_data('csv'))
         toolbar.addAction(export_btn)
-
-        # Map button
-        map_btn = QAction("Map", self)
-        map_btn.setToolTip("Open Map View")
-        map_btn.triggered.connect(self.show_map)
-        toolbar.addAction(map_btn)
-
-        toolbar.addSeparator()
-
-        # Tips toggle
-        self.tips_action = QAction("Tips", self)
-        self.tips_action.setToolTip("Toggle contextual tooltips on hover")
-        self.tips_action.setCheckable(True)
-        self.tips_action.setChecked(True)
-        self.tips_action.triggered.connect(self._toggle_tips)
-        toolbar.addAction(self.tips_action)
 
         # Spacer to push Connect to the far right
         spacer = QWidget()
@@ -408,14 +395,14 @@ class MainWindow(QMainWindow):
             self,
             "Open Capture File",
             "",
-            "All Supported (*.kismet *.pcap *.pcapng *.cap *.csv *.zip *.tar.gz *.tgz *.hc22000 *.22000);;"
+            "All Supported (*.kismet *.pcap *.pcapng *.cap *.csv *.gz *.zip *.tar.gz *.tgz *.hc22000 *.22000);;"
             "Kismet Database (*.kismet);;"
             "PCAP Files (*.pcap *.pcapng *.cap);;"
-            "WiGLE CSV (*.csv);;"
+            "WiGLE CSV (*.csv *.gz);;"
             "Zip Archives (*.zip);;"
             "Tar Archives (*.tar.gz *.tgz);;"
             "Hashcat Hashes (*.hc22000 *.22000);;"
-            "All Files (*.*)"
+            "All Files (*)"
         )
 
         if not file_path:
@@ -457,9 +444,11 @@ class MainWindow(QMainWindow):
         p = Path(file_path)
         ext = p.suffix.lower()
 
-        # Handle double extensions like .tar.gz
+        # Handle double extensions like .tar.gz and .csv.gz
         if p.name.lower().endswith('.tar.gz'):
             self._open_targz_archive(file_path)
+        elif p.name.lower().endswith('.csv.gz'):
+            self._open_wigle_csv(file_path)
         elif ext == '.tgz':
             self._open_targz_archive(file_path)
         elif ext == '.zip':
@@ -1061,6 +1050,34 @@ class MainWindow(QMainWindow):
 
         self.tab_widget.setCurrentIndex(0)
         df = self.db_reader.get_access_points(self._current_filters)
+
+        # Add handshake column from handshake data
+        if hasattr(self.db_reader, 'has_pcap_features') and self.db_reader.has_pcap_features():
+            hs_df = self.db_reader.get_handshakes()
+            if not hs_df.empty and 'bssid' in hs_df.columns and 'devmac' in df.columns:
+                hs_best = {}
+                for _, hs in hs_df.iterrows():
+                    bssid = hs.get('bssid', '')
+                    msgs = str(hs.get('messages', ''))
+                    msg_count = len([m for m in msgs.split(',') if m.strip()])
+                    complete = hs.get('complete', False)
+                    prev = hs_best.get(bssid, (0, False))
+                    if msg_count > prev[0]:
+                        hs_best[bssid] = (msg_count, complete)
+                handshake_col = []
+                for _, row in df.iterrows():
+                    mac = row.get('devmac', '')
+                    if mac in hs_best:
+                        count, complete = hs_best[mac]
+                        if complete:
+                            handshake_col.append('4-way')
+                        else:
+                            handshake_col.append(f'{count * 25}%')
+                    else:
+                        handshake_col.append('')
+                df = df.copy()
+                df['handshake'] = handshake_col
+
         # Slim columns: hide BSSID, commonname, coords, beacon/data counts, type from default
         hide = ['device', 'commonname', 'min_lat', 'min_lon', 'max_lat', 'max_lon',
                 'beacon_count', 'data_count', 'type', 'devmac']
@@ -1171,7 +1188,8 @@ class MainWindow(QMainWindow):
 
         self.tab_widget.setCurrentIndex(0)
         df = self.db_reader.get_handshakes()
-        self.handshake_view.load_data(df)
+        ap_df = self.db_reader.get_access_points()
+        self.handshake_view.load_data(df, ap_df)
         self.content_stack.setCurrentWidget(self.handshake_view)
         self._update_main_tab_title("Handshakes")
 
@@ -1343,6 +1361,21 @@ class MainWindow(QMainWindow):
         device_data = self.main_map_view.get_device_data(mac)
         if device_data:
             show_device_detail(device_data, self)
+
+    def _on_handshake_show_on_map(self, bssid: str, lat: float, lon: float):
+        """Show a single AP from handshake view on the map."""
+        self.tab_widget.setCurrentIndex(0)
+        self.content_stack.setCurrentWidget(self.main_map_view)
+        self._update_main_tab_title("Map")
+
+        if not self.db_reader.is_connected():
+            return
+
+        ap_df = self.db_reader.get_access_points()
+        if not ap_df.empty:
+            self.main_map_view.plot_devices(ap_df, color_by='type')
+
+        self.main_map_view.set_center(lat, lon, 17)
 
     def show_map(self):
         """Show the map view."""
@@ -1600,6 +1633,11 @@ class MainWindow(QMainWindow):
             include_alerts=options.get('include_alerts', True),
             max_table_rows=options.get('max_rows', 50)
         )
+
+    def _show_settings(self):
+        """Show the Settings dialog."""
+        dlg = SettingsDialog(self)
+        dlg.exec()
 
     def show_about(self):
         """Show the About dialog."""

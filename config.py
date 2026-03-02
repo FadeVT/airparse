@@ -37,7 +37,12 @@ DEFAULT_CONFIG = {
             '/usr/share/hashcat/rules',
         ],
         'user_rules_dir': '~/.local/share/hashcat/rules',
-    }
+    },
+    'wigle_api': {
+        'enabled': True,
+        'auto_enrich': True,
+        'rate_limit_seconds': 2.0,
+    },
 }
 
 # Kismet database table definitions

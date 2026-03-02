@@ -64,7 +64,7 @@ class MergedHandshake:
 
     @property
     def complete(self) -> bool:
-        return len(self.eapol_messages) >= 4 or len(self.eapol_messages) >= 2
+        return len(self.eapol_messages) >= 4
 
 
 class MergedDatabase:
@@ -149,16 +149,19 @@ class MergedDatabase:
                 mac = str(row.get('client_mac', '')).lower()
                 if not mac:
                     continue
+                last_bssid = str(row.get('last_bssid', '')).lower()
                 self._merge_client(
                     mac=mac,
                     manufacturer=str(row.get('manufacturer', '')),
                     signal=int(row.get('strongest_signal', -100) or -100),
                     first_time=self._ts_to_epoch(row.get('first_time')),
                     last_time=self._ts_to_epoch(row.get('last_time')),
-                    last_bssid=str(row.get('last_bssid', '')).lower(),
+                    last_bssid=last_bssid,
                     probed_ssids=str(row.get('probed_ssids', '')).split(', ') if row.get('probed_ssids') else [],
                     source=source_name,
                 )
+                if last_bssid and last_bssid in self._networks:
+                    self._networks[last_bssid].clients.add(mac)
 
         # Handshakes
         hs_df = reader.get_handshakes()
@@ -332,10 +335,18 @@ class MergedDatabase:
 
         self._is_loaded = True
 
+    def _link_clients_to_networks(self):
+        """Back-link all clients to their AP's clients set via associated_aps."""
+        for mac, cl in self._clients.items():
+            for ap_bssid in cl.associated_aps:
+                if ap_bssid in self._networks:
+                    self._networks[ap_bssid].clients.add(mac)
+
     # --- GPS Enrichment ---
 
     def enrich_gps(self):
         """Cross-reference BSSIDs to fill GPS gaps from other sources."""
+        self._link_clients_to_networks()
         for bssid, net in self._networks.items():
             if net.has_gps:
                 continue
@@ -371,6 +382,35 @@ class MergedDatabase:
                 net.max_lon = max_lon
                 net.has_gps = True
                 net.gps_source = 'cross-reference'
+
+    def get_networks_without_gps(self) -> list[str]:
+        """Return BSSIDs that still lack GPS after local enrichment."""
+        return [bssid for bssid, net in self._networks.items()
+                if not net.has_gps]
+
+    def apply_wigle_result(self, bssid: str, lat: float, lon: float,
+                           ssid: str = '', channel: int = 0,
+                           encryption: str = ''):
+        """Apply a WiGLE API result to a network entry."""
+        net = self._networks.get(bssid)
+        if not net:
+            return
+        if lat == 0 and lon == 0:
+            return
+        net.lat = lat
+        net.lon = lon
+        net.min_lat = lat
+        net.max_lat = lat
+        net.min_lon = lon
+        net.max_lon = lon
+        net.has_gps = True
+        net.gps_source = 'wigle-api'
+        if ssid and not net.ssid:
+            net.ssid = ssid
+        if channel and not net.channel:
+            net.channel = channel
+        if encryption and net.encryption == 'Unknown':
+            net.encryption = encryption
 
     # --- Merge helpers ---
 

@@ -1,6 +1,7 @@
 """WiGLE CSV file reader for wireless survey data."""
 
 import csv
+import gzip
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -49,15 +50,20 @@ class WigleCsvReader:
         self._devices: dict[str, dict] = {}  # MAC -> aggregated record
         self._raw_rows: int = 0
 
+    def _open_file(self, path: Path):
+        """Open a plain or gzipped file, returning a text-mode file object."""
+        if path.name.lower().endswith('.csv.gz'):
+            return gzip.open(path, 'rt', encoding='utf-8', errors='replace')
+        return open(path, 'r', encoding='utf-8', errors='replace')
+
     def open_database(self, path: str) -> bool:
-        """Validate and load a WiGLE CSV file."""
+        """Validate and load a WiGLE CSV file (plain or gzipped)."""
         self._file_path = Path(path)
 
         if not self._file_path.exists():
             raise FileNotFoundError(f"File not found: {path}")
 
-        # Validate WiGLE header
-        with open(self._file_path, 'r') as f:
+        with self._open_file(self._file_path) as f:
             first_line = f.readline()
             if not first_line.startswith('WigleWifi'):
                 raise ValueError("Not a valid WiGLE CSV file (missing WigleWifi header)")
@@ -70,7 +76,7 @@ class WigleCsvReader:
         self._devices.clear()
         self._raw_rows = 0
 
-        with open(self._file_path, 'r') as f:
+        with self._open_file(self._file_path) as f:
             # Skip WiGLE metadata header line
             next(f)
             reader = csv.DictReader(f)

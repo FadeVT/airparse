@@ -100,7 +100,16 @@ class MapView(QWidget):
 
         toolbar.addSeparator()
 
-        # Color by selector
+        # Render mode selector
+        toolbar.addWidget(QLabel("Render: "))
+        self.render_combo = QComboBox()
+        self.render_combo.addItems(["Heatmap", "Markers"])
+        self.render_combo.currentTextChanged.connect(self._on_render_changed)
+        toolbar.addWidget(self.render_combo)
+
+        toolbar.addSeparator()
+
+        # Color by selector (for marker mode)
         toolbar.addWidget(QLabel("Color by: "))
         self.color_combo = QComboBox()
         self.color_combo.addItems(["Device Type", "Signal Strength"])
@@ -260,6 +269,7 @@ class MapView(QWidget):
 <body>
     <div id="map"></div>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
     <script>
     // Global map reference for external calls
     var map = L.map('map').setView([{center_lat}, {center_lon}], {zoom});
@@ -283,6 +293,8 @@ class MapView(QWidget):
     var currentLayer = darkMatterLayer;
     var deviceData = [];
     var markers = L.layerGroup().addTo(map);
+    var heatLayer = null;
+    var renderMode = 'heat';  // 'heat' or 'markers'
     window.pendingDeviceClick = null;
 
     function openDeviceDetails(mac) {{ window.pendingDeviceClick = mac; }}
@@ -315,9 +327,43 @@ class MapView(QWidget):
 
     function refreshMarkers() {{
         markers.clearLayers();
-        deviceData.forEach(function(d) {{
-            markers.addLayer(createMarker(d));
-        }});
+        if (heatLayer) {{ map.removeLayer(heatLayer); heatLayer = null; }}
+
+        if (renderMode === 'heat') {{
+            var heatPoints = deviceData.map(function(d) {{
+                var intensity = d.signal ? Math.max(0, (d.signal + 100) / 60) : 0.5;
+                return [d.lat, d.lon, intensity];
+            }});
+            heatLayer = L.heatLayer(heatPoints, {{
+                radius: 20,
+                blur: 15,
+                maxZoom: 17,
+                gradient: {{0.2: '#0000ff', 0.4: '#00ffff', 0.6: '#00ff00', 0.8: '#ffff00', 1.0: '#ff0000'}}
+            }}).addTo(map);
+            // Also add transparent markers for click popups
+            deviceData.forEach(function(d) {{
+                var popup = '<div class="device-popup"><h4>' + (d.mac || 'Unknown') + '</h4>' +
+                    '<table><tr><td><b>Type:</b></td><td>' + (d.type || '-') + '</td></tr>' +
+                    '<tr><td><b>Name:</b></td><td>' + (d.name || '-') + '</td></tr>' +
+                    '<tr><td><b>SSID:</b></td><td>' + (d.ssid || '-') + '</td></tr>' +
+                    '<tr><td><b>Signal:</b></td><td>' + (d.signal || '-') + ' dBm</td></tr></table>' +
+                    '<a class="view-details" onclick="openDeviceDetails(\\'' + d.mac + '\\')">View Details</a></div>';
+                markers.addLayer(L.circleMarker([d.lat, d.lon], {{
+                    renderer: canvasRenderer, radius: 6,
+                    fillColor: 'transparent', color: 'transparent',
+                    weight: 0, fillOpacity: 0
+                }}).bindPopup(popup));
+            }});
+        }} else {{
+            deviceData.forEach(function(d) {{
+                markers.addLayer(createMarker(d));
+            }});
+        }}
+    }}
+
+    function setRenderMode(mode) {{
+        renderMode = mode;
+        refreshMarkers();
     }}
 
     function setDevices(devices) {{
@@ -434,6 +480,12 @@ class MapView(QWidget):
         """Handle layer selection change."""
         if self.web_view:
             self.web_view.page().runJavaScript(f"setLayer('{layer_name}');")
+
+    def _on_render_changed(self, mode_name: str):
+        """Handle render mode change."""
+        if self.web_view and self._map_ready:
+            mode = 'heat' if mode_name == 'Heatmap' else 'markers'
+            self.web_view.page().runJavaScript(f"setRenderMode('{mode}');")
 
     def _on_color_changed(self, color_option: str):
         """Handle color-by selection change."""

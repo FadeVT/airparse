@@ -436,6 +436,8 @@ class _CheckableComboBox(QComboBox):
 class HandshakeView(QWidget):
     """View showing detected WPA handshakes with progress bars and cracking."""
 
+    show_on_map = pyqtSignal(str, float, float)  # bssid, lat, lon
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._cracked: dict[str, str] = {}   # "bssid:client_mac" -> password
@@ -443,6 +445,8 @@ class HandshakeView(QWidget):
         self._active_worker = None
         self._progress_dialog = None
         self._pipeline_worker = None
+        self._geocode_worker = None
+        self._bssid_gps: dict[str, tuple[float, float]] = {}  # bssid -> (lat, lon)
         self._pipeline_dialog = None
         self._setup_ui()
 
@@ -529,14 +533,16 @@ class HandshakeView(QWidget):
 
         # Table: SSID, Capture, Timestamp, Client MAC, Status
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
-            'SSID', 'Capture', 'Timestamp', 'Client MAC', 'Status'
+            'SSID', 'Location', 'Capture', 'Timestamp', 'Client MAC', 'Status'
         ])
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
@@ -591,6 +597,29 @@ class HandshakeView(QWidget):
 
         menu.addSeparator()
 
+        # Show on Map
+        bssid = str(data.get('bssid', ''))
+        coords = self._bssid_gps.get(bssid)
+        map_action = QAction("Show on Map", self)
+        if coords:
+            map_action.triggered.connect(
+                lambda checked=False, b=bssid, c=coords: self.show_on_map.emit(b, c[0], c[1]))
+        else:
+            map_action.setText("Show on Map (no GPS)")
+            map_action.setEnabled(False)
+        menu.addAction(map_action)
+
+        # WiGLE GPS lookup (shown when no GPS and credentials configured)
+        if not coords:
+            from database.wigle_api import WigleApiClient
+            if WigleApiClient.has_credentials():
+                wigle_action = QAction("Lookup GPS on WiGLE", self)
+                wigle_action.triggered.connect(
+                    lambda checked=False, b=bssid, r=row: self._wigle_lookup(b, r))
+                menu.addAction(wigle_action)
+
+        menu.addSeparator()
+
         # Crack action
         key = f"{data.get('bssid', '')}:{data.get('client_mac', '')}"
         messages_str = str(data.get('messages', ''))
@@ -629,6 +658,39 @@ class HandshakeView(QWidget):
             menu.addAction(pipeline_action)
 
         menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def _wigle_lookup(self, bssid: str, row: int):
+        """Single BSSID lookup via WiGLE API, updates table on success."""
+        from database.wigle_api_worker import WigleApiWorker
+
+        self._wigle_worker = WigleApiWorker([bssid], self)
+
+        def on_result(result):
+            if result.found and result.lat != 0:
+                self._bssid_gps[bssid] = (result.lat, result.lon)
+                cached = _geocode_cache.get(
+                    (round(result.lat, 4), round(result.lon, 4)))
+                if cached:
+                    self.table.setItem(row, 1, QTableWidgetItem(cached))
+                else:
+                    self.table.setItem(
+                        row, 1, QTableWidgetItem(
+                            f"{result.lat:.4f}, {result.lon:.4f}"))
+                    if self._geocode_worker and self._geocode_worker.isRunning():
+                        self._geocode_worker.stop()
+                        self._geocode_worker.wait(2000)
+                    self._geocode_worker = _GeocodeWorker(
+                        [(row, result.lat, result.lon)], self)
+                    self._geocode_worker.result_ready.connect(
+                        self._on_hs_geocode_result)
+                    self._geocode_worker.start()
+            else:
+                item = QTableWidgetItem("Not on WiGLE")
+                item.setForeground(QBrush(QColor(102, 102, 102)))
+                self.table.setItem(row, 1, item)
+
+        self._wigle_worker.result_ready.connect(on_result)
+        self._wigle_worker.start()
 
     def _start_crack(self, row_data: dict, warn: bool = False):
         """Initiate a crack operation."""
@@ -791,7 +853,7 @@ class HandshakeView(QWidget):
                 else:
                     item = QTableWidgetItem("Not Found")
                     item.setForeground(QBrush(QColor(243, 156, 18)))
-                self.table.setItem(row_idx, 4, item)
+                self.table.setItem(row_idx, 5, item)
 
     # ── Pipeline controls ─────────────────────────────────────────
 
@@ -1028,7 +1090,7 @@ class HandshakeView(QWidget):
         else:
             return '#2ecc71'   # green
 
-    def load_data(self, df: pd.DataFrame):
+    def load_data(self, df: pd.DataFrame, ap_df: pd.DataFrame = None):
         """Load handshake data into the view with progress bars."""
         if df.empty:
             self.table.setRowCount(0)
@@ -1045,6 +1107,17 @@ class HandshakeView(QWidget):
         self.partial_card.set_value(str(len(partial)))
         self.total_card.set_value(str(len(df)))
 
+        # Build BSSID -> (lat, lon) lookup from AP data
+        self._bssid_gps = {}
+        if ap_df is not None and not ap_df.empty:
+            for _, ap in ap_df.iterrows():
+                mac = ap.get('devmac', '')
+                lat = float(ap.get('min_lat', 0) or 0)
+                lon = float(ap.get('min_lon', 0) or 0)
+                if mac and lat != 0 and lon != 0:
+                    self._bssid_gps[mac] = (lat, lon)
+        bssid_gps = self._bssid_gps
+
         # Sort: cracked first, then complete, then by message count desc, then timestamp
         if 'complete' in df.columns:
             df = df.copy()
@@ -1058,6 +1131,7 @@ class HandshakeView(QWidget):
                 ['_cracked', 'complete', '_msg_count', 'timestamp'],
                 ascending=[False, False, False, False])
 
+        geocode_requests = []
         self.table.setRowCount(len(df))
         for row_idx, (_, row) in enumerate(df.iterrows()):
             # Store full row data for tooltip
@@ -1065,6 +1139,22 @@ class HandshakeView(QWidget):
 
             # SSID
             self.table.setItem(row_idx, 0, QTableWidgetItem(str(row.get('ssid', ''))))
+
+            # Location (from AP GPS data, geocoded async)
+            bssid = row.get('bssid', '')
+            coords = bssid_gps.get(bssid)
+            if coords:
+                lat, lon = coords
+                cached = _geocode_cache.get((round(lat, 4), round(lon, 4)))
+                if cached:
+                    self.table.setItem(row_idx, 1, QTableWidgetItem(cached))
+                else:
+                    self.table.setItem(row_idx, 1, QTableWidgetItem(f"{lat:.4f}, {lon:.4f}"))
+                    geocode_requests.append((row_idx, lat, lon))
+            else:
+                item = QTableWidgetItem("")
+                item.setForeground(QBrush(QColor(102, 102, 102)))
+                self.table.setItem(row_idx, 1, item)
 
             # Capture progress bar
             messages_str = str(row.get('messages', ''))
@@ -1091,15 +1181,15 @@ class HandshakeView(QWidget):
                     border-radius: 2px;
                 }}
             """)
-            self.table.setCellWidget(row_idx, 1, progress)
+            self.table.setCellWidget(row_idx, 2, progress)
 
             # Timestamp
             ts = row.get('timestamp', '')
             ts_str = str(ts)[:19] if pd.notna(ts) else ''
-            self.table.setItem(row_idx, 2, QTableWidgetItem(ts_str))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(ts_str))
 
             # Client MAC
-            self.table.setItem(row_idx, 3, QTableWidgetItem(str(row.get('client_mac', ''))))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(str(row.get('client_mac', ''))))
 
             # Status (cracked indicator)
             key = f"{row.get('bssid', '')}:{row.get('client_mac', '')}"
@@ -1111,10 +1201,28 @@ class HandshakeView(QWidget):
                 else:
                     item = QTableWidgetItem("Not Found")
                     item.setForeground(QBrush(QColor(243, 156, 18)))
-                self.table.setItem(row_idx, 4, item)
+                self.table.setItem(row_idx, 5, item)
+
+        # Start background geocoding
+        if geocode_requests:
+            if self._geocode_worker and self._geocode_worker.isRunning():
+                self._geocode_worker.stop()
+                self._geocode_worker.result_ready.disconnect()
+                self._geocode_worker.wait(2000)
+            self._geocode_worker = _GeocodeWorker(geocode_requests, self)
+            self._geocode_worker.result_ready.connect(self._on_hs_geocode_result)
+            self._geocode_worker.start()
 
         self._update_cracked_status()
         self._update_start_btn_label()
+
+    def _on_hs_geocode_result(self, row_idx: int, address: str):
+        """Update handshake table with geocoded address."""
+        try:
+            if address and row_idx < self.table.rowCount():
+                self.table.setItem(row_idx, 1, QTableWidgetItem(address))
+        except RuntimeError:
+            pass
 
 
 class DeauthView(QWidget):

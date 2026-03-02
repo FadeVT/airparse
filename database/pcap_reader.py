@@ -720,6 +720,23 @@ class PcapReader:
 
         if not bssid or not client_mac:
             return
+
+        # Check for EAPOL before filtering — PMKID captures may have
+        # zeroed client MACs (e.g. pwnagotchi msg 1 only captures)
+        hdr_len = 24
+        fc = buf[0] | (buf[1] << 8)
+        if (fc >> 4) & 0xf >= 8:  # QoS subtypes are 8+
+            hdr_len += 2
+
+        if len(buf) >= hdr_len + 8:
+            llc = buf[hdr_len:hdr_len + 8]
+            if llc[:6] == b'\xaa\xaa\x03\x00\x00\x00':
+                ethertype = (llc[6] << 8) | llc[7]
+                if ethertype == 0x888e:  # EAPOL
+                    eapol_data = buf[hdr_len + 8:]
+                    eapol_client = client_mac if client_mac != '00:00:00:00:00:00' else bssid
+                    self._process_raw_eapol(bssid, eapol_client, eapol_data, ts)
+
         if _is_broadcast_or_multicast(client_mac):
             return
         if _is_broadcast_or_multicast(bssid):
@@ -747,24 +764,6 @@ class PcapReader:
         client.associated_aps.add(bssid)
         client.packet_count += 1
 
-        # Check for EAPOL (802.1X authentication / WPA handshake)
-        # Data frame header is 24 bytes (or 30 with addr4 for WDS)
-        # After that: LLC/SNAP header (8 bytes) with ethertype
-        hdr_len = 24
-        # Check QoS (subtype bit 3)
-        fc = buf[0] | (buf[1] << 8)
-        if (fc >> 4) & 0xf >= 8:  # QoS subtypes are 8+
-            hdr_len += 2
-
-        if len(buf) >= hdr_len + 8:
-            llc = buf[hdr_len:hdr_len + 8]
-            # LLC/SNAP: AA AA 03 00 00 00 [ethertype]
-            if llc[:6] == b'\xaa\xaa\x03\x00\x00\x00':
-                ethertype = (llc[6] << 8) | llc[7]
-                if ethertype == 0x888e:  # EAPOL
-                    eapol_data = buf[hdr_len + 8:]
-                    self._process_raw_eapol(bssid, client_mac, eapol_data, ts)
-
     def _process_raw_eapol(self, bssid: str, client_mac: str,
                            eapol_data: bytes, ts: int):
         """Detect WPA 4-way handshake from raw EAPOL bytes."""
@@ -778,15 +777,16 @@ class PcapReader:
         install = bool(key_info & 0x0040)
         ack = bool(key_info & 0x0080)
         mic = bool(key_info & 0x0100)
+        secure = bool(key_info & 0x0200)
 
         msg_num = 0
         if pairwise and ack and not mic:
             msg_num = 1
-        elif pairwise and mic and not ack and not install:
+        elif pairwise and mic and not ack and not secure:
             msg_num = 2
         elif pairwise and ack and mic and install:
             msg_num = 3
-        elif pairwise and mic and not ack:
+        elif pairwise and mic and not ack and secure:
             msg_num = 4
 
         if msg_num == 0:

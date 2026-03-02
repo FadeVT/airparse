@@ -388,6 +388,40 @@ class _PullWorker(QThread):
                 self.progress.emit("Enriching GPS data...")
                 merged.enrich_gps()
 
+            # WiGLE API enrichment for remaining GPS-less BSSIDs
+            if not self._cancelled:
+                try:
+                    from database.wigle_api import WigleApiClient
+                    client = WigleApiClient()
+                    if client.has_credentials():
+                        missing = merged.get_networks_without_gps()
+                        uncached = [b for b in missing if not client.is_cached(b)]
+                        if uncached:
+                            self.progress.emit(
+                                f"WiGLE API: looking up {len(uncached)} BSSIDs...")
+                            for i, bssid in enumerate(uncached):
+                                if self._cancelled:
+                                    break
+                                self.progress.emit(
+                                    f"WiGLE API: {i + 1}/{len(uncached)} — {bssid}")
+                                result = client.lookup_bssid(bssid)
+                                if result.found and result.lat != 0:
+                                    merged.apply_wigle_result(
+                                        bssid, result.lat, result.lon,
+                                        result.ssid, result.channel,
+                                        result.encryption)
+                        # Also apply cached positive results for remaining missing
+                        still_missing = merged.get_networks_without_gps()
+                        for bssid in still_missing:
+                            cached = client.get_cached(bssid)
+                            if cached and cached.found and cached.lat != 0:
+                                merged.apply_wigle_result(
+                                    bssid, cached.lat, cached.lon,
+                                    cached.ssid, cached.channel,
+                                    cached.encryption)
+                except Exception as e:
+                    log.warning("WiGLE API enrichment failed: %s", e)
+
             self.finished.emit(merged, '')
 
         except Exception as e:
@@ -395,7 +429,9 @@ class _PullWorker(QThread):
             self.finished.emit(None, str(e))
 
     def _ingest_file(self, merged: MergedDatabase, path: str, source_name: str):
-        ext = Path(path).suffix.lower()
+        p = Path(path)
+        name_lower = p.name.lower()
+        ext = p.suffix.lower()
         try:
             if ext == '.kismet':
                 reader = KismetDBReader()
@@ -411,12 +447,34 @@ class _PullWorker(QThread):
                 reader = Hc22000Reader()
                 reader.open_database(path)
                 merged.ingest_hc22000(reader, source_name)
-            elif ext == '.csv':
+            elif ext == '.csv' or name_lower.endswith('.csv.gz'):
                 reader = WigleCsvReader()
                 reader.open_database(path)
                 merged.ingest_wigle(reader, source_name)
+            elif ext == '.zip':
+                self._ingest_zip(merged, path, source_name)
+            elif name_lower.endswith('.tar.gz') or ext == '.tgz':
+                self._ingest_targz(merged, path, source_name)
         except Exception as e:
             log.warning("Failed to parse %s: %s", path, e)
+
+    def _ingest_zip(self, merged: MergedDatabase, path: str, source_name: str):
+        import zipfile, tempfile
+        with zipfile.ZipFile(path, 'r') as zf:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zf.extractall(tmpdir)
+                for f in Path(tmpdir).rglob('*'):
+                    if f.is_file():
+                        self._ingest_file(merged, str(f), source_name)
+
+    def _ingest_targz(self, merged: MergedDatabase, path: str, source_name: str):
+        import tarfile, tempfile
+        with tarfile.open(path, 'r:gz') as tf:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tf.extractall(tmpdir, filter='data')
+                for f in Path(tmpdir).rglob('*'):
+                    if f.is_file():
+                        self._ingest_file(merged, str(f), source_name)
 
 
 class ConnectDialog(QDialog):
@@ -576,8 +634,14 @@ class ConnectDialog(QDialog):
     def _browse_local(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select Local Files", "",
-            "All Supported (*.kismet *.pcap *.pcapng *.cap *.csv *.hc22000 *.22000);;"
-            "All Files (*.*)"
+            "All Supported (*.kismet *.pcap *.pcapng *.cap *.csv *.gz *.zip *.tar.gz *.tgz *.hc22000 *.22000);;"
+            "Kismet Database (*.kismet);;"
+            "PCAP Files (*.pcap *.pcapng *.cap);;"
+            "WiGLE CSV (*.csv *.gz);;"
+            "Zip Archives (*.zip);;"
+            "Tar Archives (*.tar.gz *.tgz);;"
+            "Hashcat Hashes (*.hc22000 *.22000);;"
+            "All Files (*)"
         )
         if paths:
             self._local_files = paths
