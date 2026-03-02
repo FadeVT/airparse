@@ -31,6 +31,12 @@ DEFAULT_CONFIG = {
     'hashcat': {
         'wordlist_path': '/usr/share/wordlists/rockyou.txt',
         'use_gpu': True,
+        'default_crack_level': 'standard',
+        'rules_search_paths': [
+            '/usr/share/doc/hashcat/rules',
+            '/usr/share/hashcat/rules',
+        ],
+        'user_rules_dir': '~/.local/share/hashcat/rules',
     }
 }
 

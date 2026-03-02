@@ -4,11 +4,12 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QStatusBar, QTabWidget, QStackedWidget,
     QTreeWidget, QTreeWidgetItem, QSplitter, QLabel,
-    QFileDialog, QMessageBox, QDockWidget
+    QFileDialog, QMessageBox, QDockWidget, QPushButton, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QAction
 
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
@@ -19,6 +20,7 @@ from database.reader import KismetDBReader
 from database.pcap_reader import PcapReader
 from database.pcap_worker import PcapParseWorker
 from database.wigle_reader import WigleCsvReader
+from database.hc22000_reader import Hc22000Reader
 from ui.device_table import DeviceTableView
 from ui.filters import FilterPanel
 from ui.statistics import StatisticsPanel
@@ -28,6 +30,7 @@ from ui.map_view import MapView
 from ui.timeline import TimelineView
 from ui.pcap_progress import PcapProgressDialog
 from ui.pcap_views import HandshakeView, DeauthView, ProbeMapView, FrameTypeView, NetworksView
+from ui.connect_dialog import ConnectDialog
 from export.export_dialog import show_export_dialog
 from export.csv_exporter import CSVExporter
 from export.json_exporter import JSONExporter
@@ -353,6 +356,35 @@ class MainWindow(QMainWindow):
         self.tips_action.triggered.connect(self._toggle_tips)
         toolbar.addAction(self.tips_action)
 
+        # Spacer to push Connect to the far right
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
+
+        # Connect button — far right, styled to stand out
+        connect_btn = QPushButton("Connect")
+        connect_btn.setToolTip("Connect to devices and pull capture data")
+        connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        connect_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2980b9;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 5px 16px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #3498db;
+            }
+            QPushButton:pressed {
+                background-color: #2471a3;
+            }
+        """)
+        connect_btn.clicked.connect(self._on_connect)
+        toolbar.addWidget(connect_btn)
+
     def setup_status_bar(self):
         """Set up the status bar."""
         self.status_bar = QStatusBar()
@@ -376,11 +408,13 @@ class MainWindow(QMainWindow):
             self,
             "Open Capture File",
             "",
-            "All Supported (*.kismet *.pcap *.pcapng *.cap *.csv *.zip);;"
+            "All Supported (*.kismet *.pcap *.pcapng *.cap *.csv *.zip *.tar.gz *.tgz *.hc22000 *.22000);;"
             "Kismet Database (*.kismet);;"
             "PCAP Files (*.pcap *.pcapng *.cap);;"
             "WiGLE CSV (*.csv);;"
             "Zip Archives (*.zip);;"
+            "Tar Archives (*.tar.gz *.tgz);;"
+            "Hashcat Hashes (*.hc22000 *.22000);;"
             "All Files (*.*)"
         )
 
@@ -389,11 +423,46 @@ class MainWindow(QMainWindow):
 
         self._open_file_by_type(file_path)
 
+    def _on_connect(self):
+        """Open the Connect dialog to pull data from remote devices."""
+        dlg = ConnectDialog(self)
+        if dlg.exec() == ConnectDialog.DialogCode.Accepted:
+            merged = dlg.get_merged_database()
+            if merged and merged.is_connected():
+                self.db_reader = merged
+                info = merged.get_device_summary()
+                self.db_path_label.setText(
+                    f"Merged: {info['sources']} sources, "
+                    f"{info['access_points']} APs, "
+                    f"{info['handshakes']} handshakes"
+                )
+                # Show PCAP nav if merged DB has PCAP data
+                if merged.has_pcap_features():
+                    self.pcap_nav_item.setHidden(False)
+                    if hasattr(self, 'handshake_view') and merged.primary_pcap_path:
+                        self.handshake_view.set_pcap_path(merged.primary_pcap_path)
+                else:
+                    self.pcap_nav_item.setHidden(True)
+
+                self.update_overview()
+                self._update_filter_time_range()
+                gps_count = info.get('gps_enriched', 0)
+                self.status_bar.showMessage(
+                    f"Merged {info['access_points']} APs from {info['sources']} sources "
+                    f"({gps_count} with GPS)", 5000
+                )
+
     def _open_file_by_type(self, file_path: str):
         """Route a file to the appropriate opener based on extension."""
-        ext = Path(file_path).suffix.lower()
+        p = Path(file_path)
+        ext = p.suffix.lower()
 
-        if ext == '.zip':
+        # Handle double extensions like .tar.gz
+        if p.name.lower().endswith('.tar.gz'):
+            self._open_targz_archive(file_path)
+        elif ext == '.tgz':
+            self._open_targz_archive(file_path)
+        elif ext == '.zip':
             self._open_zip_archive(file_path)
         elif ext == '.kismet':
             self._open_kismet_database(file_path)
@@ -401,6 +470,8 @@ class MainWindow(QMainWindow):
             self._open_pcap_file(file_path)
         elif ext == '.csv':
             self._open_wigle_csv(file_path)
+        elif ext in ('.hc22000', '.22000'):
+            self._open_hc22000_file(file_path)
         else:
             # Try Kismet first, fall back to PCAP
             try:
@@ -486,6 +557,82 @@ class MainWindow(QMainWindow):
                 self, "Error", f"Failed to open zip archive:\n{str(e)}"
             )
 
+    def _open_targz_archive(self, tar_path: str):
+        """Extract and open capture/CSV files from a tar.gz archive."""
+        try:
+            with tarfile.open(tar_path, 'r:*') as tf:
+                members = [m for m in tf.getmembers() if m.isfile()]
+                capture_exts = {'.kismet', '.pcap', '.pcapng', '.cap'}
+                csv_exts = {'.csv'}
+
+                capture_files = [m for m in members if Path(m.name).suffix.lower() in capture_exts]
+                csv_files = [m for m in members if Path(m.name).suffix.lower() in csv_exts]
+
+                if not capture_files:
+                    capture_files = csv_files
+                    csv_files = []
+
+                if not capture_files:
+                    QMessageBox.warning(
+                        self, "No Capture Files",
+                        "No supported capture files found in the archive."
+                    )
+                    return
+
+                if len(capture_files) > 1:
+                    from PyQt6.QtWidgets import QInputDialog
+                    labels = [Path(f.name).name for f in capture_files]
+                    choice, ok = QInputDialog.getItem(
+                        self, "Select Capture File",
+                        "Multiple capture files found. Select one:",
+                        labels, 0, False
+                    )
+                    if not ok:
+                        return
+                    selected = capture_files[labels.index(choice)]
+                else:
+                    selected = capture_files[0]
+
+                self._cleanup_temp_dir()
+                self._temp_dir = tempfile.mkdtemp(prefix='airparse_tar_')
+                tf.extract(selected, self._temp_dir, filter='data')
+                extracted_path = str(Path(self._temp_dir) / selected.name)
+
+                self._pending_wigle_csvs = []
+                if Path(selected.name).suffix.lower() in ('.pcap', '.pcapng', '.cap'):
+                    for csv_member in csv_files:
+                        tf.extract(csv_member, self._temp_dir, filter='data')
+                        csv_path = str(Path(self._temp_dir) / csv_member.name)
+                        try:
+                            with open(csv_path, 'r') as cf:
+                                if cf.readline().startswith('WigleWifi'):
+                                    self._pending_wigle_csvs.append(csv_path)
+                        except Exception:
+                            pass
+                elif Path(selected.name).suffix.lower() == '.csv':
+                    # All CSVs selected as primary — load them all as WiGLE
+                    for csv_member in csv_files:
+                        tf.extract(csv_member, self._temp_dir, filter='data')
+                        csv_path = str(Path(self._temp_dir) / csv_member.name)
+                        try:
+                            with open(csv_path, 'r') as cf:
+                                if cf.readline().startswith('WigleWifi'):
+                                    self._pending_wigle_csvs.append(csv_path)
+                        except Exception:
+                            pass
+
+                self.status_bar.showMessage(
+                    f"Extracted {Path(selected.name).name} from {Path(tar_path).name}", 3000
+                )
+                self._open_file_by_type(extracted_path)
+
+        except tarfile.TarError:
+            QMessageBox.critical(self, "Error", "Not a valid tar archive.")
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error", f"Failed to open tar archive:\n{str(e)}"
+            )
+
     def _open_kismet_database(self, file_path: str):
         """Open a .kismet SQLite database, with auto-repair on corruption."""
         try:
@@ -534,6 +681,27 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self, "Error",
                 f"Failed to open WiGLE CSV:\n{str(e)}"
+            )
+
+    def _open_hc22000_file(self, file_path: str):
+        """Open a .hc22000 hashcat hash file."""
+        try:
+            reader = Hc22000Reader()
+            reader.open_database(file_path)
+            self.db_reader = reader
+            self.db_path_label.setText(f"Hashcat: {Path(file_path).name}")
+            self.pcap_nav_item.setHidden(False)
+            self.update_overview()
+            self._update_filter_time_range()
+            info = reader.get_database_info()
+            self.status_bar.showMessage(
+                f"Loaded {info.get('hash_count', 0)} hashes from "
+                f"{info.get('network_count', 0)} networks", 5000
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to open hashcat file:\n{str(e)}"
             )
 
     def _open_pcap_file(self, file_path: str):

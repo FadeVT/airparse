@@ -20,6 +20,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QDateTime, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QBrush, QAction, QCursor
 
+from config import DEFAULT_CONFIG
+
 try:
     import pyqtgraph as pg
     HAS_PYQTGRAPH = True
@@ -336,6 +338,101 @@ class _SummaryCard(QFrame):
         self.value_label.setText(value)
 
 
+class _CheckableComboBox(QComboBox):
+    """QComboBox with checkboxes for multi-select (wordlist picker)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from PyQt6.QtGui import QStandardItemModel, QStandardItem
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        self.setEditable(False)
+        self._items: list[tuple[str, str, bool]] = []  # (display, path, checked)
+        self.setStyleSheet("""
+            QComboBox {
+                background-color: #3c3f41; color: #e0e0e0;
+                border: 1px solid #555; border-radius: 4px;
+                padding: 4px 8px; min-width: 130px;
+            }
+            QComboBox:hover { background-color: #4c5052; }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView {
+                background-color: #2b2b2b; color: #e0e0e0;
+                selection-background-color: #3c3f41;
+                border: 1px solid #555;
+            }
+        """)
+
+    def add_wordlist(self, display: str, path: str, checked: bool = False):
+        from PyQt6.QtGui import QStandardItem
+        item = QStandardItem(display)
+        item.setCheckable(True)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        item.setData(path, Qt.ItemDataRole.UserRole)
+        self._model.appendRow(item)
+        self._update_text()
+
+    def get_selected_paths(self) -> list[str]:
+        paths = []
+        for i in range(self._model.rowCount()):
+            item = self._model.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                paths.append(item.data(Qt.ItemDataRole.UserRole))
+        return paths
+
+    def _update_text(self):
+        count = len(self.get_selected_paths())
+        self.setCurrentText(f"Wordlists ({count})")
+
+    def hidePopup(self):
+        self._update_text()
+        super().hidePopup()
+
+    def paintEvent(self, event):
+        from PyQt6.QtWidgets import QStylePainter, QStyleOptionComboBox
+        painter = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        count = len(self.get_selected_paths())
+        opt.currentText = f"Wordlists ({count})"
+        painter.drawComplexControl(QStylePainter.ComplexControl.CC_ComboBox, opt)
+        painter.drawControl(QStylePainter.ControlElement.CE_ComboBoxLabel, opt)
+
+    def scan_wordlists(self):
+        """Scan common directories for wordlist files."""
+        dirs = [
+            Path('/usr/share/wordlists'),
+            Path.home() / 'wordlists',
+            Path('/usr/share/seclists/Passwords'),
+        ]
+        seen = set()
+        entries = []  # (display, path, size)
+
+        for d in dirs:
+            if not d.exists():
+                continue
+            try:
+                for f in d.iterdir():
+                    if f.is_file() and f.suffix not in ('.gz', '.tar', '.zip', '.bz2'):
+                        if f.name not in seen and f.stat().st_size > 0:
+                            seen.add(f.name)
+                            size = f.stat().st_size
+                            entries.append((f.name, str(f), size))
+            except PermissionError:
+                continue
+
+        # Sort by size ascending (quick wins first)
+        entries.sort(key=lambda e: e[2])
+
+        for name, path, size in entries:
+            if size >= 1_048_576:
+                display = f"{name} ({size / 1_048_576:.0f} MB)"
+            else:
+                display = f"{name} ({size / 1024:.0f} KB)"
+            auto_select = 'rockyou' in name.lower()
+            self.add_wordlist(display, path, checked=auto_select)
+
+
 class HandshakeView(QWidget):
     """View showing detected WPA handshakes with progress bars and cracking."""
 
@@ -345,6 +442,8 @@ class HandshakeView(QWidget):
         self._pcap_path: str = ''
         self._active_worker = None
         self._progress_dialog = None
+        self._pipeline_worker = None
+        self._pipeline_dialog = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -369,6 +468,49 @@ class HandshakeView(QWidget):
         cards_layout.addWidget(self.total_card)
         cards_layout.addWidget(self.cracked_card)
         cards_layout.addStretch()
+
+        # Pipeline controls
+        self._wordlist_combo = _CheckableComboBox(self)
+        self._wordlist_combo.scan_wordlists()
+        cards_layout.addWidget(self._wordlist_combo)
+
+        self._level_combo = QComboBox(self)
+        self._level_combo.addItems([
+            "Quick (~1 min)",
+            "Standard (~10 min)",
+            "Deep (~1 hr)",
+            "Exhaustive (~4 hrs)",
+        ])
+        self._level_combo.setCurrentIndex(1)  # Default: Standard
+        self._level_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #3c3f41; color: #e0e0e0;
+                border: 1px solid #555; border-radius: 4px;
+                padding: 4px 8px; min-width: 120px;
+            }
+            QComboBox:hover { background-color: #4c5052; }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView {
+                background-color: #2b2b2b; color: #e0e0e0;
+                selection-background-color: #3c3f41;
+                border: 1px solid #555;
+            }
+        """)
+        cards_layout.addWidget(self._level_combo)
+
+        self._start_btn = QPushButton("Crack All (0)")
+        self._start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2ecc71; color: #1e1e1e;
+                border: none; border-radius: 4px;
+                padding: 6px 16px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #27ae60; }
+            QPushButton:disabled { background-color: #555; color: #999; }
+        """)
+        self._start_btn.clicked.connect(self._on_start_btn)
+        cards_layout.addWidget(self._start_btn)
+
         cards_layout.addWidget(_make_help_button(
             "WPA Handshakes\n\n"
             "WPA/WPA2 networks use a 4-way EAPOL handshake when a client "
@@ -379,7 +521,8 @@ class HandshakeView(QWidget):
             "  50% = Messages 1 & 2\n"
             "  75% = Messages 1, 2 & 3\n"
             "  100% = Complete handshake\n\n"
-            "Right-click a handshake to crack the password with hashcat.\n"
+            "Select rows and use the pipeline controls to crack passwords.\n"
+            "Right-click a single handshake for quick single-crack.\n"
             "Requires: hashcat, hcxtools, and a wordlist (e.g. rockyou.txt).",
             self))
         layout.addLayout(cards_layout)
@@ -397,9 +540,12 @@ class HandshakeView(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(
+            QTableWidget.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setMouseTracking(True)
         self.table.cellEntered.connect(self._show_tooltip)
+        self.table.itemSelectionChanged.connect(self._update_start_btn_label)
 
         # Context menu
         self.table.setContextMenuPolicy(
@@ -474,6 +620,14 @@ class HandshakeView(QWidget):
                 "Need at least 75% capture (3 of 4 EAPOL messages).")
 
         menu.addAction(crack_action)
+
+        # Pipeline crack for selection
+        selected = self._get_selected_crackable()
+        if len(selected) > 1 and self._pipeline_worker is None:
+            pipeline_action = QAction(f"Crack {len(selected)} Selected (Pipeline)...", self)
+            pipeline_action.triggered.connect(self._start_pipeline)
+            menu.addAction(pipeline_action)
+
         menu.exec(self.table.viewport().mapToGlobal(position))
 
     def _start_crack(self, row_data: dict, warn: bool = False):
@@ -482,7 +636,6 @@ class HandshakeView(QWidget):
             check_dependencies, find_wordlist,
             CrackProgressDialog, CrackResultDialog)
         from database.hashcat_worker import HashcatWorker
-        from config import DEFAULT_CONFIG
         from PyQt6.QtWidgets import QMessageBox
 
         # Dependency check
@@ -640,6 +793,229 @@ class HandshakeView(QWidget):
                     item.setForeground(QBrush(QColor(243, 156, 18)))
                 self.table.setItem(row_idx, 4, item)
 
+    # ── Pipeline controls ─────────────────────────────────────────
+
+    def _get_crackable_count(self) -> int:
+        """Count rows with >= 75% capture that aren't already cracked."""
+        count = 0
+        for row_idx in range(self.table.rowCount()):
+            data = self.table.property(f'row_data_{row_idx}')
+            if not data:
+                continue
+            key = f"{data.get('bssid', '')}:{data.get('client_mac', '')}"
+            if key in self._cracked and self._cracked[key]:
+                continue
+            messages_str = str(data.get('messages', ''))
+            msg_count = len([m for m in messages_str.split(',') if m.strip()]) if messages_str else 0
+            if msg_count >= 3:
+                count += 1
+        return count
+
+    def _get_selected_crackable(self) -> list[int]:
+        """Get selected row indices that are crackable (>= 75%)."""
+        rows = set()
+        for item in self.table.selectedItems():
+            rows.add(item.row())
+        crackable = []
+        for row_idx in sorted(rows):
+            data = self.table.property(f'row_data_{row_idx}')
+            if not data:
+                continue
+            key = f"{data.get('bssid', '')}:{data.get('client_mac', '')}"
+            if key in self._cracked and self._cracked[key]:
+                continue
+            messages_str = str(data.get('messages', ''))
+            msg_count = len([m for m in messages_str.split(',') if m.strip()]) if messages_str else 0
+            if msg_count >= 3:
+                crackable.append(row_idx)
+        return crackable
+
+    def _update_start_btn_label(self):
+        """Update the Start button label based on selection state."""
+        if self._pipeline_worker is not None:
+            return  # Don't update while running
+
+        selected = self._get_selected_crackable()
+        if selected:
+            self._start_btn.setText(f"Crack {len(selected)} Selected")
+        else:
+            count = self._get_crackable_count()
+            self._start_btn.setText(f"Crack All ({count})")
+
+    def _on_start_btn(self):
+        """Handle Start/Cancel button click."""
+        if self._pipeline_worker is not None:
+            # Cancel running pipeline
+            self._pipeline_worker.cancel()
+            return
+
+        self._start_pipeline()
+
+    def _start_pipeline(self):
+        """Start the multi-stage cracking pipeline."""
+        from ui.crack_dialog import check_dependencies
+        from ui.pipeline_dialog import PipelineProgressDialog, RuleDownloadDialog
+        from database.pipeline_worker import PipelineWorker
+        from PyQt6.QtWidgets import QMessageBox
+
+        # Dependency check
+        ok, msg = check_dependencies()
+        if not ok:
+            QMessageBox.warning(self, "Missing Dependencies", msg)
+            return
+
+        # Wordlists
+        wordlists = self._wordlist_combo.get_selected_paths()
+        if not wordlists:
+            QMessageBox.warning(self, "No Wordlists",
+                                "Select at least one wordlist from the dropdown.")
+            return
+
+        # PCAP path
+        if not self._pcap_path:
+            QMessageBox.warning(self, "No PCAP", "No PCAP file loaded.")
+            return
+
+        # Gather targets
+        selected = self._get_selected_crackable()
+        if selected:
+            row_indices = selected
+        else:
+            # All crackable rows
+            row_indices = []
+            for row_idx in range(self.table.rowCount()):
+                data = self.table.property(f'row_data_{row_idx}')
+                if not data:
+                    continue
+                key = f"{data.get('bssid', '')}:{data.get('client_mac', '')}"
+                if key in self._cracked and self._cracked[key]:
+                    continue
+                messages_str = str(data.get('messages', ''))
+                msg_count = len([m for m in messages_str.split(',') if m.strip()]) if messages_str else 0
+                if msg_count >= 3:
+                    row_indices.append(row_idx)
+
+        if not row_indices:
+            QMessageBox.information(self, "Nothing to Crack",
+                                    "No crackable handshakes found (need >= 75% capture).")
+            return
+
+        targets = []
+        for row_idx in row_indices:
+            data = self.table.property(f'row_data_{row_idx}')
+            if data:
+                targets.append({
+                    'bssid': str(data.get('bssid', '')),
+                    'client_mac': str(data.get('client_mac', '')),
+                    'ssid': str(data.get('ssid', '')),
+                })
+
+        # Crack level
+        level_map = {0: 'quick', 1: 'standard', 2: 'deep', 3: 'exhaustive'}
+        crack_level = level_map.get(self._level_combo.currentIndex(), 'standard')
+
+        use_gpu = DEFAULT_CONFIG['hashcat']['use_gpu']
+
+        # Create worker
+        self._pipeline_worker = PipelineWorker(
+            self._pcap_path, targets, wordlists, crack_level, use_gpu)
+
+        # Create progress dialog
+        self._pipeline_dialog = PipelineProgressDialog(
+            crack_level, len(targets), self)
+        self._pipeline_dialog.cancelled.connect(self._on_pipeline_cancel)
+
+        # Wire signals
+        self._pipeline_worker.stage_changed.connect(
+            self._pipeline_dialog.on_stage_changed)
+        self._pipeline_worker.stage_progress.connect(
+            self._pipeline_dialog.on_stage_progress)
+        self._pipeline_worker.hash_cracked.connect(
+            self._pipeline_dialog.on_hash_cracked)
+        self._pipeline_worker.hash_cracked.connect(
+            self._on_pipeline_hash_cracked)
+        self._pipeline_worker.finished.connect(
+            self._pipeline_dialog.on_finished)
+        self._pipeline_worker.finished.connect(
+            self._on_pipeline_finished)
+        self._pipeline_worker.error.connect(
+            self._on_pipeline_error)
+        self._pipeline_worker.rule_download_needed.connect(
+            self._on_rule_download_needed)
+
+        # Update UI
+        self._start_btn.setText("Cancel")
+        self._start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c; color: #ffffff;
+                border: none; border-radius: 4px;
+                padding: 6px 16px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """)
+
+        # Start
+        self._pipeline_worker.start()
+        self._pipeline_dialog.show()
+
+    def _on_pipeline_cancel(self):
+        if self._pipeline_worker:
+            self._pipeline_worker.cancel()
+
+    def _on_pipeline_hash_cracked(self, bssid: str, client_mac: str, password: str):
+        """Handle a hash cracked during pipeline."""
+        key = f"{bssid}:{client_mac}"
+        self._cracked[key] = password
+        self._update_cracked_status()
+
+    def _on_pipeline_finished(self, cracked: int, attempted: int):
+        """Handle pipeline completion."""
+        self._pipeline_worker = None
+
+        # Restore start button
+        self._start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2ecc71; color: #1e1e1e;
+                border: none; border-radius: 4px;
+                padding: 6px 16px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #27ae60; }
+            QPushButton:disabled { background-color: #555; color: #999; }
+        """)
+        self._update_start_btn_label()
+
+    def _on_pipeline_error(self, msg: str):
+        """Handle pipeline error."""
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.warning(self, "Pipeline Error", msg)
+
+    def _on_rule_download_needed(self):
+        """Handle request to download OneRuleToRuleThemAll.rule."""
+        from ui.pipeline_dialog import RuleDownloadDialog
+        from PyQt6.QtWidgets import QMessageBox
+
+        reply = QMessageBox.question(
+            self, "Rule File Needed",
+            "Stage 3 requires OneRuleToRuleThemAll.rule "
+            "(~1.2 MB optimized mutation rules).\n\n"
+            "Download it now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        if reply != QMessageBox.StandardButton.Yes:
+            if self._pipeline_worker:
+                self._pipeline_worker.set_rule_download_result(None)
+            return
+
+        dlg = RuleDownloadDialog(self)
+
+        def on_done(success, result):
+            if self._pipeline_worker:
+                self._pipeline_worker.set_rule_download_result(result if success else None)
+
+        dlg.download_finished.connect(on_done)
+        dlg.start_download()
+        dlg.exec()
+
     @staticmethod
     def _progress_color(pct: int) -> str:
         """Return stylesheet chunk color for given percentage."""
@@ -738,6 +1114,7 @@ class HandshakeView(QWidget):
                 self.table.setItem(row_idx, 4, item)
 
         self._update_cracked_status()
+        self._update_start_btn_label()
 
 
 class DeauthView(QWidget):
