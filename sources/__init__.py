@@ -86,11 +86,11 @@ DEFAULT_SOURCES = [
     SourceConfig(
         source_type='kismet',
         name='Kismet RPi5',
-        host='',  # User must configure
-        user='pi',
-        remote_path='/home/pi/.kismet/',
+        host='192.168.1.204',
+        user='fade',
+        remote_path='/home/fade/Documents/Kismet/',
         file_types=['.kismet'],
-        enabled=False,
+        enabled=True,
     ),
     SourceConfig(
         source_type='pwnagotchi',
@@ -106,7 +106,7 @@ DEFAULT_SOURCES = [
         name='Hak5 Pager',
         host='172.16.52.1',
         user='root',
-        remote_path='/root/handshakes/',
+        remote_path='/mmc/root/loot/handshakes/',
         file_types=['.pcap', '.22000'],
         enabled=True,
     ),

@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QSpinBox, QFileDialog, QMessageBox, QProgressBar,
     QGroupBox, QFormLayout
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QElapsedTimer
 from PyQt6.QtGui import QFont
 
 from sources import (
@@ -318,31 +318,90 @@ class _PullWorker(QThread):
     """Background thread for pulling files and building merged database."""
     progress = pyqtSignal(str)  # status message
     file_pulled = pyqtSignal(str, str)  # source_name, filename
+    byte_progress = pyqtSignal(int, int)  # bytes_transferred, bytes_total
     finished = pyqtSignal(object, str)  # MergedDatabase or None, error
 
     def __init__(self, source_widgets: list[_SourceWidget],
-                 local_files: list[str], only_new: bool):
+                 local_files: list[str], only_new: bool, delete_after: bool = False):
         super().__init__()
         # Snapshot widget state on GUI thread to avoid cross-thread access
         self._sources = [
-            (sw.config, sw.config.file_types)
+            (sw.config, sw.config.file_types, sw._total_size)
             for sw in source_widgets
             if sw.check.isChecked() and sw._online
         ]
         self._local_files = local_files
         self._only_new = only_new
+        self._delete_after = delete_after
         self._cancelled = False
+        self._bytes_total = sum(s[2] for s in self._sources)
+        self._bytes_transferred = 0
+        self._current_file_base = 0
 
     def cancel(self):
         self._cancelled = True
+
+    def _stop_service(self, config):
+        """Stop the capture service on a device before pulling."""
+        try:
+            import paramiko
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            key_path = Path(config.key_file).expanduser()
+            kwargs = {
+                'hostname': config.host,
+                'port': config.port,
+                'username': config.user,
+                'timeout': 10,
+            }
+            if key_path.exists():
+                kwargs['key_filename'] = str(key_path)
+            ssh.connect(**kwargs)
+            if config.source_type == 'kismet':
+                ssh.exec_command('sudo systemctl stop kismet', timeout=10)
+            elif config.source_type == 'pager':
+                ssh.exec_command('/etc/init.d/pineapd stop', timeout=10)
+            ssh.close()
+        except Exception as e:
+            log.warning("Failed to stop service on %s: %s", config.name, e)
+
+    def _start_service(self, config):
+        """Restart the capture service on a device after pulling."""
+        try:
+            import paramiko
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            key_path = Path(config.key_file).expanduser()
+            kwargs = {
+                'hostname': config.host,
+                'port': config.port,
+                'username': config.user,
+                'timeout': 10,
+            }
+            if key_path.exists():
+                kwargs['key_filename'] = str(key_path)
+            ssh.connect(**kwargs)
+            if config.source_type == 'kismet':
+                ssh.exec_command('sudo systemctl start kismet', timeout=10)
+            elif config.source_type == 'pager':
+                ssh.exec_command('/etc/init.d/pineapd start', timeout=10)
+            ssh.close()
+        except Exception as e:
+            log.warning("Failed to start service on %s: %s", config.name, e)
 
     def run(self):
         try:
             merged = MergedDatabase()
             manifest = load_manifest()
 
+            # Stop capture services before pulling for clean files
+            for config, file_types, source_size in self._sources:
+                if config.source_type in ('kismet', 'pager'):
+                    self.progress.emit(f"Stopping {config.name}...")
+                    self._stop_service(config)
+
             # Pull from remote sources (snapshotted in __init__)
-            for config, file_types in self._sources:
+            for config, file_types, source_size in self._sources:
                 if self._cancelled:
                     break
 
@@ -355,8 +414,12 @@ class _PullWorker(QThread):
                 src_name = config.name
                 def _file_cb(name, transferred, total, _sn=src_name):
                     self.file_pulled.emit(_sn, name)
+                    current = self._current_file_base + transferred
+                    self.byte_progress.emit(current, self._bytes_total)
 
                 result = source.pull_files(dest, manifest, self._only_new, _file_cb)
+                # Advance base offset for next source
+                self._current_file_base += source_size
 
                 # Parse pulled files
                 for local_path in result.files_pulled:
@@ -375,7 +438,12 @@ class _PullWorker(QThread):
                             if ext in (file_types or ['.pcap', '.kismet', '.22000']):
                                 self._ingest_file(merged, str(existing), config.name)
 
+                # Delete pulled files from device
+                if self._delete_after and result.files_pulled and not self._cancelled:
+                    self._delete_remote_files(config, source, result)
+
             save_manifest(manifest)
+            self.byte_progress.emit(-1, -1)  # signal: pull phase done, switch to indeterminate
 
             # Process local files
             for lf in self._local_files:
@@ -427,6 +495,28 @@ class _PullWorker(QThread):
         except Exception as e:
             log.exception("Pull worker error")
             self.finished.emit(None, str(e))
+
+    def _delete_remote_files(self, config, source, result):
+        """Delete successfully pulled files from the remote device."""
+        try:
+            cls = SOURCE_CONSTRUCTORS.get(config.source_type, DeviceSource)
+            src = cls(config)
+            sftp = src._get_sftp()
+            remote_files = src.list_files()
+            pulled_names = {Path(p).name for p in result.files_pulled}
+            deleted = 0
+            for rf in remote_files:
+                if Path(rf.path).name in pulled_names:
+                    try:
+                        self.progress.emit(f"Deleting {Path(rf.path).name} from {config.name}...")
+                        sftp.remove(rf.path)
+                        deleted += 1
+                    except Exception as e:
+                        log.warning("Failed to delete %s: %s", rf.path, e)
+            src._close()
+            self.progress.emit(f"Deleted {deleted} files from {config.name}")
+        except Exception as e:
+            log.warning("Failed to clean up files on %s: %s", config.name, e)
 
     def _ingest_file(self, merged: MergedDatabase, path: str, source_name: str):
         p = Path(path)
@@ -544,6 +634,10 @@ class ConnectDialog(QDialog):
         self._only_new_check = QCheckBox("Pull only new files (skip already seen)")
         self._only_new_check.setChecked(True)
         layout.addWidget(self._only_new_check)
+
+        self._delete_after_check = QCheckBox("Delete files from devices after pull")
+        self._delete_after_check.setChecked(False)
+        layout.addWidget(self._delete_after_check)
 
         # Progress
         self._progress_bar = QProgressBar()
@@ -665,26 +759,87 @@ class ConnectDialog(QDialog):
         self._progress_bar.setVisible(True)
         self._progress_label.setVisible(True)
         self._progress_label.setText("Starting...")
+        self._pull_timer = QElapsedTimer()
+        self._pull_timer.start()
 
         checked_sources = [sw for sw in self._source_widgets
                            if sw.check.isChecked() and sw._online]
 
         self._pull_worker = _PullWorker(
             checked_sources, self._local_files,
-            self._only_new_check.isChecked()
+            self._only_new_check.isChecked(),
+            self._delete_after_check.isChecked()
         )
         self._pull_worker.progress.connect(self._on_pull_progress)
         self._pull_worker.file_pulled.connect(self._on_file_pulled)
+        self._pull_worker.byte_progress.connect(self._on_byte_progress)
         self._pull_worker.finished.connect(self._on_pull_finished)
+
+        total = self._pull_worker._bytes_total
+        if total > 0:
+            self._progress_bar.setRange(0, 100)
+            self._progress_bar.setValue(0)
+        else:
+            self._progress_bar.setRange(0, 0)
+
         self._pull_worker.start()
 
     def _on_pull_progress(self, message: str):
         self._progress_label.setText(message)
 
     def _on_file_pulled(self, source: str, filename: str):
-        self._progress_label.setText(f"{source}: {filename}")
+        pass  # byte_progress handles the display now
+
+    def _on_byte_progress(self, transferred: int, total: int):
+        if transferred == -1:
+            self._progress_bar.setRange(0, 0)  # indeterminate for parsing phase
+            return
+        if total <= 0:
+            return
+
+        # Files may grow while pulling (e.g. live Kismet logging) — adjust total upward
+        if transferred > total:
+            total = transferred
+
+        pct = min(int(transferred * 100 / total), 100)
+        self._progress_bar.setValue(pct)
+
+        elapsed_ms = self._pull_timer.elapsed()
+        if elapsed_ms < 1000 or transferred < 1:
+            self._progress_label.setText(
+                f"{self._fmt_size(transferred)} / {self._fmt_size(total)}  ({pct}%)")
+            return
+
+        speed = transferred / (elapsed_ms / 1000.0)
+        remaining = max(0, total - transferred)
+        if speed > 0 and remaining > 0:
+            eta_secs = int(remaining / speed)
+            if eta_secs >= 3600:
+                eta_str = f"{eta_secs // 3600}h {(eta_secs % 3600) // 60}m"
+            elif eta_secs >= 60:
+                eta_str = f"{eta_secs // 60}m {eta_secs % 60}s"
+            else:
+                eta_str = f"{eta_secs}s"
+            eta_part = f"  •  {eta_str} remaining"
+        else:
+            eta_part = ""
+
+        self._progress_label.setText(
+            f"{self._fmt_size(transferred)} / {self._fmt_size(total)}  "
+            f"({pct}%)  •  {self._fmt_size(int(speed))}/s{eta_part}")
+
+    @staticmethod
+    def _fmt_size(nbytes: int) -> str:
+        if nbytes >= 1_073_741_824:
+            return f"{nbytes / 1_073_741_824:.1f} GB"
+        if nbytes >= 1_048_576:
+            return f"{nbytes / 1_048_576:.1f} MB"
+        if nbytes >= 1024:
+            return f"{nbytes / 1024:.0f} KB"
+        return f"{nbytes} B"
 
     def _on_pull_finished(self, merged_db: Optional[MergedDatabase], error: str):
+        stopped_sources = self._pull_worker._sources if self._pull_worker else []
         self._pull_worker = None
         self._progress_bar.setVisible(False)
         self._pull_btn.setEnabled(True)
@@ -693,6 +848,7 @@ class ConnectDialog(QDialog):
             self._progress_label.setText(f"Error: {error}")
             self._progress_label.setStyleSheet("color: #e74c3c; border: none; background: transparent;")
             QMessageBox.critical(self, "Error", f"Pull failed:\n{error}")
+            self._offer_restart(stopped_sources)
             return
 
         if merged_db and merged_db.is_connected():
@@ -702,10 +858,65 @@ class ConnectDialog(QDialog):
                 f"Done: {info['access_points']} APs, {info['clients']} clients, "
                 f"{info['handshakes']} handshakes, GPS for {info.get('gps_enriched', 0)}")
             self._progress_label.setStyleSheet("color: #2ecc71; border: none; background: transparent;")
+            self._offer_restart(stopped_sources)
             self.accept()
         else:
             self._progress_label.setText("No data found.")
             self._progress_label.setStyleSheet("color: #f39c12; border: none; background: transparent;")
+            self._offer_restart(stopped_sources)
+
+    def _offer_restart(self, sources):
+        """Ask user if they want to restart stopped capture services."""
+        restartable = [
+            (config, ft, sz) for config, ft, sz in sources
+            if config.source_type in ('kismet', 'pager')
+        ]
+        if not restartable:
+            return
+
+        names = ', '.join(c.name for c, _, _ in restartable)
+        reply = QMessageBox.question(
+            self, "Restart Services",
+            f"Transfer complete. Restart capture services?\n\n{names}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            for config, _, _ in restartable:
+                self._restart_service(config)
+
+    def _restart_service(self, config):
+        """Restart a capture service in a background thread."""
+        import paramiko
+        def _do_restart():
+            try:
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                key_path = Path(config.key_file).expanduser()
+                kwargs = {
+                    'hostname': config.host,
+                    'port': config.port,
+                    'username': config.user,
+                    'timeout': 10,
+                }
+                if key_path.exists():
+                    kwargs['key_filename'] = str(key_path)
+                ssh.connect(**kwargs)
+                if config.source_type == 'kismet':
+                    ssh.exec_command('sudo systemctl start kismet', timeout=10)
+                elif config.source_type == 'pager':
+                    ssh.exec_command('/etc/init.d/pineapd start', timeout=10)
+                ssh.close()
+            except Exception as e:
+                log.warning("Failed to restart %s: %s", config.name, e)
+
+        worker = QThread()
+        worker.run = _do_restart
+        worker.start()
+        # Keep reference so it doesn't get GC'd
+        if not hasattr(self, '_restart_workers'):
+            self._restart_workers = []
+        self._restart_workers.append(worker)
 
     def _on_cancel(self):
         if self._pull_worker and self._pull_worker.isRunning():

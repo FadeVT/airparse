@@ -31,6 +31,7 @@ from ui.timeline import TimelineView
 from ui.pcap_progress import PcapProgressDialog
 from ui.pcap_views import HandshakeView, DeauthView, ProbeMapView, FrameTypeView, NetworksView
 from ui.connect_dialog import ConnectDialog
+from ui.control_view import ControlView
 from ui.settings_dialog import SettingsDialog
 from export.export_dialog import show_export_dialog
 from export.csv_exporter import CSVExporter
@@ -183,10 +184,15 @@ class MainWindow(QMainWindow):
         self.content_stack.addWidget(self.networks_view)
 
         # Add the content stack as the first (and default) tab
-        tab_widget.addTab(self.content_stack, "Main View")
+        tab_widget.addTab(self.content_stack, "View")
 
-        # Make the first tab non-closable
+        # Control tab
+        self.control_view = ControlView()
+        tab_widget.addTab(self.control_view, "Control")
+
+        # Make built-in tabs non-closable
         tab_widget.tabBar().setTabButton(0, tab_widget.tabBar().ButtonPosition.RightSide, None)
+        tab_widget.tabBar().setTabButton(1, tab_widget.tabBar().ButtonPosition.RightSide, None)
 
         # Track current view name for tab title
         self._current_view_name = "Overview"
