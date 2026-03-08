@@ -10,6 +10,7 @@ import logging
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -228,6 +229,165 @@ class WigleApiClient:
         except Exception as e:
             log.warning('WiGLE lookup failed for %s: %s', bssid, e)
             return WigleResult(bssid=bssid)
+
+    def get_user_stats(self) -> dict:
+        """Fetch WiGLE user statistics (discovered, ranks).
+        Returns dict with keys: discovered, total_locations, month_rank,
+        prev_month_rank, rank, prev_rank. Empty dict on failure.
+        """
+        if not self.has_credentials():
+            return {}
+        self._wait_for_rate_limit()
+        try:
+            req = urllib.request.Request(
+                f'{_BASE_URL}/stats/user',
+                headers={
+                    'Authorization': self._auth_header(),
+                    'Accept': 'application/json',
+                    'User-Agent': 'AirParse/2.0',
+                })
+            self._record_request()
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            stats = data.get('statistics', {})
+            return {
+                'discovered': stats.get('discoveredWiFiGPS', 0) + stats.get('discoveredWiFi', 0),
+                'total_locations': stats.get('totalWiFiLocations', 0),
+                'month_rank': stats.get('monthRank', 0),
+                'prev_month_rank': stats.get('prevMonthRank', 0),
+                'rank': stats.get('rank', 0),
+                'prev_rank': stats.get('prevRank', 0),
+            }
+        except Exception as e:
+            log.warning('WiGLE stats fetch failed: %s', e)
+            return {}
+
+    def get_transactions(self) -> list[dict]:
+        """Fetch all WiGLE upload transactions, paginating through all pages."""
+        if not self.has_credentials():
+            return []
+        all_results = []
+        page_start = 0
+        while True:
+            self._wait_for_rate_limit()
+            try:
+                req = urllib.request.Request(
+                    f'{_BASE_URL}/file/transactions?pagestart={page_start}',
+                    headers={
+                        'Authorization': self._auth_header(),
+                        'Accept': 'application/json',
+                        'User-Agent': 'AirParse/2.0',
+                    })
+                self._record_request()
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read())
+                results = data.get('results', [])
+                if not results:
+                    break
+                all_results.extend(results)
+                page_start += len(results)
+            except Exception as e:
+                log.warning('WiGLE transactions fetch failed at page %d: %s', page_start, e)
+                break
+        return all_results
+
+    def upload_file(self, file_path: str) -> tuple[bool, str]:
+        """Upload a wiglecsv file to WiGLE.
+        Returns (success, transid_or_error).
+        """
+        if not self.has_credentials():
+            return False, 'No credentials configured'
+        self._wait_for_rate_limit()
+        try:
+            boundary = f'----AirParseBoundary{int(time.time())}'
+            filename = Path(file_path).name
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
+            body = (
+                f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                f'Content-Type: application/octet-stream\r\n\r\n'
+            ).encode() + file_data + f'\r\n--{boundary}--\r\n'.encode()
+            req = urllib.request.Request(
+                f'{_BASE_URL}/file/upload',
+                data=body,
+                headers={
+                    'Authorization': self._auth_header(),
+                    'Content-Type': f'multipart/form-data; boundary={boundary}',
+                    'Accept': 'application/json',
+                    'User-Agent': 'AirParse/2.0',
+                },
+                method='POST')
+            self._record_request()
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+            transid = data.get('transid', '')
+            if transid:
+                return True, transid
+            return True, 'Uploaded (no transid returned)'
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', errors='replace')
+            try:
+                msg = json.loads(body).get('message', e.reason)
+            except Exception:
+                msg = e.reason
+            return False, f'HTTP {e.code}: {msg}'
+        except Exception as e:
+            return False, str(e)
+
+    def search_networks(self, **kwargs) -> list[dict]:
+        """Search WiGLE network database.
+        Supported kwargs: ssid, netid (BSSID), ssidlike, encryption,
+        freenet, paynet, latrange1, latrange2, longrange1, longrange2,
+        lastupdt, resultsPerPage.
+        Returns list of network result dicts.
+        """
+        if not self.has_credentials():
+            return []
+        self._wait_for_rate_limit()
+        params = '&'.join(f'{k}={urllib.parse.quote(str(v))}' for k, v in kwargs.items() if v)
+        try:
+            req = urllib.request.Request(
+                f'{_BASE_URL}/network/search?{params}',
+                headers={
+                    'Authorization': self._auth_header(),
+                    'Accept': 'application/json',
+                    'User-Agent': 'AirParse/2.0',
+                })
+            self._record_request()
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            self._backoff = _MIN_REQUEST_INTERVAL
+            return data.get('results', [])
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                self._backoff = min(self._backoff * 2, 60.0)
+            log.warning('WiGLE search failed: HTTP %d', e.code)
+            return []
+        except Exception as e:
+            log.warning('WiGLE search failed: %s', e)
+            return []
+
+    def download_kml(self, transid: str) -> tuple[bool, bytes]:
+        """Download KML file for a transaction.
+        Returns (success, kml_bytes).
+        """
+        if not self.has_credentials():
+            return False, b''
+        self._wait_for_rate_limit()
+        try:
+            req = urllib.request.Request(
+                f'{_BASE_URL}/file/kml/{transid}',
+                headers={
+                    'Authorization': self._auth_header(),
+                    'User-Agent': 'AirParse/2.0',
+                })
+            self._record_request()
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return True, resp.read()
+        except Exception as e:
+            log.warning('WiGLE KML download failed for %s: %s', transid, e)
+            return False, b''
 
     def _cache_result(self, bssid_upper: str, result: WigleResult):
         cache = self._load_cache()

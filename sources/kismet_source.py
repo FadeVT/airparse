@@ -36,3 +36,16 @@ class KismetSource(DeviceSource):
             pass
 
         return sorted(files, key=lambda f: f.mtime, reverse=True)
+
+    def scan_additional_paths(self) -> list[str]:
+        """Look for WiGLE CSV files alongside Kismet captures."""
+        csv_paths = []
+        try:
+            sftp = self._get_sftp()
+            base = self.config.remote_path.rstrip('/')
+            for entry in sftp.listdir_attr(base):
+                if entry.filename.lower().endswith('.wiglecsv'):
+                    csv_paths.append(f"{base}/{entry.filename}")
+        except Exception:
+            pass
+        return csv_paths

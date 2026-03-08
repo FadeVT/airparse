@@ -264,6 +264,7 @@ class DeviceSource:
         manifest: dict,
         only_new: bool = True,
         progress_cb: Optional[Callable[[str, int, int], None]] = None,
+        extensions: set = None,
     ) -> PullResult:
         """Pull capture files from the device.
 
@@ -284,6 +285,12 @@ class DeviceSource:
             files = self.list_files()
 
             for rf in files:
+                if extensions:
+                    ext = Path(rf.path).suffix.lower()
+                    if ext not in extensions:
+                        result.files_skipped += 1
+                        continue
+
                 manifest_key = f"{self.config.name}:{rf.path}"
 
                 if only_new and manifest_key in manifest:

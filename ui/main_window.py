@@ -32,6 +32,8 @@ from ui.pcap_progress import PcapProgressDialog
 from ui.pcap_views import HandshakeView, DeauthView, ProbeMapView, FrameTypeView, NetworksView
 from ui.connect_dialog import ConnectDialog
 from ui.control_view import ControlView
+from ui.wigle_view import WigleView
+from ui.search_view import SearchView
 from ui.settings_dialog import SettingsDialog
 from export.export_dialog import show_export_dialog
 from export.csv_exporter import CSVExporter
@@ -59,6 +61,7 @@ class MainWindow(QMainWindow):
         """Set up the main UI layout."""
         self.setWindowTitle("AirParse")
         self.setMinimumSize(1200, 800)
+        self._pcap_nav_visible = False
 
         # Create central widget with main layout
         central_widget = QWidget()
@@ -91,7 +94,19 @@ class MainWindow(QMainWindow):
         self.nav_tree.setHeaderLabel("Navigation")
         self.nav_tree.setMinimumWidth(100)
 
-        # Add tree items
+        # Build initial nav items (View tab)
+        self._build_view_nav()
+
+        # Connect selection signal
+        self.nav_tree.itemClicked.connect(self._on_nav_item_clicked)
+
+        layout.addWidget(self.nav_tree)
+        return sidebar
+
+    def _build_view_nav(self):
+        """Populate sidebar with View tab navigation items."""
+        self.nav_tree.clear()
+
         stats_item = QTreeWidgetItem(["Statistics"])
         self.nav_tree.addTopLevelItem(stats_item)
 
@@ -119,24 +134,68 @@ class MainWindow(QMainWindow):
         timeline_item = QTreeWidgetItem(["Timeline"])
         self.nav_tree.addTopLevelItem(timeline_item)
 
-        # PCAP-specific items (hidden by default)
         self.pcap_nav_item = QTreeWidgetItem(["PCAP Analysis"])
         self.pcap_nav_item.addChild(QTreeWidgetItem(["Handshakes"]))
         self.pcap_nav_item.addChild(QTreeWidgetItem(["Deauth Frames"]))
         self.pcap_nav_item.addChild(QTreeWidgetItem(["Probe Requests"]))
         self.pcap_nav_item.addChild(QTreeWidgetItem(["Frame Types"]))
         self.nav_tree.addTopLevelItem(self.pcap_nav_item)
-        self.pcap_nav_item.setHidden(True)
+        self.pcap_nav_item.setHidden(not self._pcap_nav_visible)
         self.pcap_nav_item.setExpanded(True)
 
-        # Expand devices by default
         devices_item.setExpanded(True)
 
-        # Connect selection signal
-        self.nav_tree.itemClicked.connect(self._on_nav_item_clicked)
+    def _build_control_nav(self):
+        """Populate sidebar with Control tab navigation items."""
+        self.nav_tree.clear()
 
-        layout.addWidget(self.nav_tree)
-        return sidebar
+        kismet_item = QTreeWidgetItem(["Kismet RPi5"])
+        kismet_item.addChild(QTreeWidgetItem(["Service"]))
+        kismet_item.addChild(QTreeWidgetItem(["GPS"]))
+        kismet_item.addChild(QTreeWidgetItem(["Logging"]))
+        self.nav_tree.addTopLevelItem(kismet_item)
+        kismet_item.setExpanded(True)
+
+        pager_item = QTreeWidgetItem(["Hak5 Pager"])
+        pager_item.addChild(QTreeWidgetItem(["Recon Service"]))
+        self.nav_tree.addTopLevelItem(pager_item)
+        pager_item.setExpanded(True)
+
+        files_item = QTreeWidgetItem(["File Management"])
+        files_item.addChild(QTreeWidgetItem(["Kismet RPi5"]))
+        files_item.addChild(QTreeWidgetItem(["Hak5 Pager"]))
+        files_item.addChild(QTreeWidgetItem(["Local Storage"]))
+        self.nav_tree.addTopLevelItem(files_item)
+        files_item.setExpanded(True)
+
+    def _build_search_nav(self):
+        """Populate sidebar with Search tab navigation items."""
+        self.nav_tree.clear()
+        self.nav_tree.addTopLevelItem(QTreeWidgetItem(["Network Search"]))
+
+    def _build_wigle_nav(self):
+        """Populate sidebar with WiGLE tab navigation items."""
+        self.nav_tree.clear()
+
+        dash_item = QTreeWidgetItem(["Dashboard"])
+        self.nav_tree.addTopLevelItem(dash_item)
+
+        upload_item = QTreeWidgetItem(["Upload"])
+        self.nav_tree.addTopLevelItem(upload_item)
+
+        dl_item = QTreeWidgetItem(["Downloads"])
+        self.nav_tree.addTopLevelItem(dl_item)
+
+    def _on_tab_changed(self, index: int):
+        """Rebuild sidebar navigation when the active tab changes."""
+        if index == 0:
+            self._build_view_nav()
+        elif index == 1:
+            self._build_control_nav()
+        elif index == 2:
+            self._build_search_nav()
+        elif index == 3:
+            self._build_wigle_nav()
 
     def _create_tab_widget(self) -> QTabWidget:
         """Create the main tabbed content area."""
@@ -190,12 +249,23 @@ class MainWindow(QMainWindow):
         self.control_view = ControlView()
         tab_widget.addTab(self.control_view, "Control")
 
+        # Search tab
+        self.search_view = SearchView()
+        tab_widget.addTab(self.search_view, "Search")
+
+        # WiGLE tab
+        self.wigle_view = WigleView()
+        tab_widget.addTab(self.wigle_view, "WiGLE")
+
         # Make built-in tabs non-closable
-        tab_widget.tabBar().setTabButton(0, tab_widget.tabBar().ButtonPosition.RightSide, None)
-        tab_widget.tabBar().setTabButton(1, tab_widget.tabBar().ButtonPosition.RightSide, None)
+        for i in range(4):
+            tab_widget.tabBar().setTabButton(i, tab_widget.tabBar().ButtonPosition.RightSide, None)
 
         # Track current view name for tab title
         self._current_view_name = "Overview"
+
+        # Contextual sidebar — rebuild nav when tab changes
+        tab_widget.currentChanged.connect(self._on_tab_changed)
 
         return tab_widget
 
@@ -431,11 +501,15 @@ class MainWindow(QMainWindow):
                 )
                 # Show PCAP nav if merged DB has PCAP data
                 if merged.has_pcap_features():
-                    self.pcap_nav_item.setHidden(False)
+                    self._pcap_nav_visible = True
+                    if hasattr(self, 'pcap_nav_item'):
+                        self.pcap_nav_item.setHidden(False)
                     if hasattr(self, 'handshake_view') and merged.primary_pcap_path:
                         self.handshake_view.set_pcap_path(merged.primary_pcap_path)
                 else:
-                    self.pcap_nav_item.setHidden(True)
+                    self._pcap_nav_visible = False
+                    if hasattr(self, 'pcap_nav_item'):
+                        self.pcap_nav_item.setHidden(True)
 
                 self.update_overview()
                 self._update_filter_time_range()
@@ -635,7 +709,9 @@ class MainWindow(QMainWindow):
             reader.open_database(file_path)
             self.db_reader = reader
             self.db_path_label.setText(f"Database: {file_path}")
-            self.pcap_nav_item.setHidden(True)
+            self._pcap_nav_visible = False
+            if hasattr(self, 'pcap_nav_item'):
+                self.pcap_nav_item.setHidden(True)
             self.update_overview()
             self._update_filter_time_range()
             self.status_bar.showMessage("Database loaded successfully", 3000)
@@ -664,7 +740,9 @@ class MainWindow(QMainWindow):
             reader.open_database(file_path)
             self.db_reader = reader
             self.db_path_label.setText(f"WiGLE CSV: {Path(file_path).name}")
-            self.pcap_nav_item.setHidden(True)
+            self._pcap_nav_visible = False
+            if hasattr(self, 'pcap_nav_item'):
+                self.pcap_nav_item.setHidden(True)
             self.update_overview()
             self._update_filter_time_range()
             info = reader.get_database_info()
@@ -685,7 +763,9 @@ class MainWindow(QMainWindow):
             reader.open_database(file_path)
             self.db_reader = reader
             self.db_path_label.setText(f"Hashcat: {Path(file_path).name}")
-            self.pcap_nav_item.setHidden(False)
+            self._pcap_nav_visible = True
+            if hasattr(self, 'pcap_nav_item'):
+                self.pcap_nav_item.setHidden(False)
             self.update_overview()
             self._update_filter_time_range()
             info = reader.get_database_info()
@@ -763,7 +843,9 @@ class MainWindow(QMainWindow):
             self.handshake_view.set_pcap_path(self._pending_path)
 
         self.db_path_label.setText(f"PCAP: {self._pending_path}")
-        self.pcap_nav_item.setHidden(False)
+        self._pcap_nav_visible = True
+        if hasattr(self, 'pcap_nav_item'):
+            self.pcap_nav_item.setHidden(False)
         self.update_overview()
         self._update_filter_time_range()
 
@@ -908,9 +990,12 @@ class MainWindow(QMainWindow):
         self.device_count_label.setText("")
         self.last_updated_label.setText("")
 
-        # Close all tabs except Overview
-        while self.tab_widget.count() > 1:
-            self.tab_widget.removeTab(1)
+        # Close dynamic tabs (keep View, Control, WiGLE)
+        while self.tab_widget.count() > 4:
+            self.tab_widget.removeTab(self.tab_widget.count() - 1)
+        self._pcap_nav_visible = False
+        if self.tab_widget.currentIndex() == 0:
+            self._build_view_nav()
 
     def refresh_data(self):
         """Refresh data from the database."""
@@ -1012,7 +1097,53 @@ class MainWindow(QMainWindow):
     def _on_nav_item_clicked(self, item: QTreeWidgetItem, column: int):
         """Handle navigation tree item clicks."""
         item_text = item.text(0)
+        current_tab = self.tab_widget.currentIndex()
 
+        # WiGLE tab nav
+        if current_tab == 3:
+            page_map = {
+                "Dashboard": WigleView.PAGE_DASHBOARD,
+                "Upload": WigleView.PAGE_UPLOAD,
+                "Downloads": WigleView.PAGE_DOWNLOADS,
+            }
+            page = page_map.get(item_text)
+            if page is not None:
+                self.wigle_view.show_page(page)
+            return
+
+        # Control tab nav
+        if current_tab == 1:
+            parent = item.parent()
+            parent_text = parent.text(0) if parent else ""
+
+            # File Management section
+            if parent_text == "File Management" or item_text == "File Management":
+                if item_text == "Kismet RPi5":
+                    self.control_view.show_page(ControlView.PAGE_KISMET_FILES)
+                elif item_text == "Hak5 Pager":
+                    self.control_view.show_page(ControlView.PAGE_PAGER_FILES)
+                elif item_text == "Local Storage":
+                    self.control_view.show_page(ControlView.PAGE_LOCAL_STORAGE)
+                else:
+                    self.control_view.show_page(ControlView.PAGE_KISMET_FILES)
+                return
+
+            # Devices section
+            self.control_view.show_page(ControlView.PAGE_DEVICES)
+            section_map = {
+                "Kismet RPi5": "kismet_service",
+                "Service": "kismet_service",
+                "GPS": "kismet_gps",
+                "Logging": "kismet_logging",
+                "Hak5 Pager": "pager_recon",
+                "Recon Service": "pager_recon",
+            }
+            section = section_map.get(item_text)
+            if section:
+                self.control_view.scroll_to_section(section)
+            return
+
+        # View tab nav
         if item_text == "Statistics":
             self._show_statistics()
         elif item_text == "Access Points":

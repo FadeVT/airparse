@@ -1,6 +1,7 @@
 """Connect dialog for discovering devices and pulling capture data."""
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -322,7 +323,8 @@ class _PullWorker(QThread):
     finished = pyqtSignal(object, str)  # MergedDatabase or None, error
 
     def __init__(self, source_widgets: list[_SourceWidget],
-                 local_files: list[str], only_new: bool, delete_after: bool = False):
+                 local_files: list[str], only_new: bool, delete_after: bool = False,
+                 pull_extensions: set = None):
         super().__init__()
         # Snapshot widget state on GUI thread to avoid cross-thread access
         self._sources = [
@@ -333,6 +335,7 @@ class _PullWorker(QThread):
         self._local_files = local_files
         self._only_new = only_new
         self._delete_after = delete_after
+        self._pull_extensions = pull_extensions
         self._cancelled = False
         self._bytes_total = sum(s[2] for s in self._sources)
         self._bytes_transferred = 0
@@ -417,7 +420,8 @@ class _PullWorker(QThread):
                     current = self._current_file_base + transferred
                     self.byte_progress.emit(current, self._bytes_total)
 
-                result = source.pull_files(dest, manifest, self._only_new, _file_cb)
+                result = source.pull_files(dest, manifest, self._only_new, _file_cb,
+                                          self._pull_extensions)
                 # Advance base offset for next source
                 self._current_file_base += source_size
 
@@ -438,6 +442,33 @@ class _PullWorker(QThread):
                             if ext in (file_types or ['.pcap', '.kismet', '.22000']):
                                 self._ingest_file(merged, str(existing), config.name)
 
+                # Pull additional files (WiGLE CSVs from device-specific paths)
+                additional = source.scan_additional_paths()
+                if additional:
+                    sftp = source._get_sftp()
+                    wigle_dest = dest / 'wigle'
+                    wigle_dest.mkdir(parents=True, exist_ok=True)
+                    for remote_path in additional:
+                        fname = Path(remote_path).name
+                        local_path = wigle_dest / fname
+                        manifest_key = f"{config.name}:wigle:{remote_path}"
+                        if self._only_new and manifest_key in manifest:
+                            continue
+                        try:
+                            self.progress.emit(f"Pulling {fname}...")
+                            sftp.get(remote_path, str(local_path))
+                            result.files_pulled.append(str(local_path))
+                            manifest[manifest_key] = {
+                                'pulled_at': __import__('datetime').datetime.now().isoformat(),
+                                'local_path': str(local_path),
+                            }
+                        except Exception as e:
+                            log.warning("Failed to pull %s: %s", remote_path, e)
+                    source._close()
+
+                # Stage wiglecsv files for WiGLE upload
+                self._stage_wiglecsv_files(result.files_pulled, dest)
+
                 # Delete pulled files from device
                 if self._delete_after and result.files_pulled and not self._cancelled:
                     self._delete_remote_files(config, source, result)
@@ -456,45 +487,39 @@ class _PullWorker(QThread):
                 self.progress.emit("Enriching GPS data...")
                 merged.enrich_gps()
 
-            # WiGLE API enrichment for remaining GPS-less BSSIDs
-            if not self._cancelled:
-                try:
-                    from database.wigle_api import WigleApiClient
-                    client = WigleApiClient()
-                    if client.has_credentials():
-                        missing = merged.get_networks_without_gps()
-                        uncached = [b for b in missing if not client.is_cached(b)]
-                        if uncached:
-                            self.progress.emit(
-                                f"WiGLE API: looking up {len(uncached)} BSSIDs...")
-                            for i, bssid in enumerate(uncached):
-                                if self._cancelled:
-                                    break
-                                self.progress.emit(
-                                    f"WiGLE API: {i + 1}/{len(uncached)} — {bssid}")
-                                result = client.lookup_bssid(bssid)
-                                if result.found and result.lat != 0:
-                                    merged.apply_wigle_result(
-                                        bssid, result.lat, result.lon,
-                                        result.ssid, result.channel,
-                                        result.encryption)
-                        # Also apply cached positive results for remaining missing
-                        still_missing = merged.get_networks_without_gps()
-                        for bssid in still_missing:
-                            cached = client.get_cached(bssid)
-                            if cached and cached.found and cached.lat != 0:
-                                merged.apply_wigle_result(
-                                    bssid, cached.lat, cached.lon,
-                                    cached.ssid, cached.channel,
-                                    cached.encryption)
-                except Exception as e:
-                    log.warning("WiGLE API enrichment failed: %s", e)
-
             self.finished.emit(merged, '')
 
         except Exception as e:
             log.exception("Pull worker error")
             self.finished.emit(None, str(e))
+
+    def _stage_wiglecsv_files(self, pulled_files: list[str], pull_dest: Path):
+        """Copy any wiglecsv files to the WiGLE upload staging directory."""
+        stage_dir = Path.home() / '.config' / 'airparse' / 'wigle_uploads'
+
+        def _is_wiglecsv(p: Path) -> bool:
+            name = p.name.lower()
+            return name.endswith('.wiglecsv') or (
+                name.endswith('.csv') and 'wigle' in str(p.parent).lower())
+
+        for fp in pulled_files:
+            p = Path(fp)
+            if _is_wiglecsv(p):
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                staged = stage_dir / p.name
+                if not staged.exists():
+                    shutil.copy2(fp, staged)
+                    self.progress.emit(f"Staged {p.name} for WiGLE upload")
+
+        # Also check the pull directory and wigle subdirectory
+        for search_dir in [pull_dest, pull_dest / 'wigle']:
+            if search_dir.exists():
+                for existing in search_dir.iterdir():
+                    if existing.is_file() and _is_wiglecsv(existing):
+                        stage_dir.mkdir(parents=True, exist_ok=True)
+                        staged = stage_dir / existing.name
+                        if not staged.exists():
+                            shutil.copy2(str(existing), staged)
 
     def _delete_remote_files(self, config, source, result):
         """Delete successfully pulled files from the remote device."""
@@ -639,6 +664,24 @@ class ConnectDialog(QDialog):
         self._delete_after_check.setChecked(False)
         layout.addWidget(self._delete_after_check)
 
+        # File type filter
+        ft_layout = QHBoxLayout()
+        ft_layout.addWidget(QLabel("Pull file types:"))
+        self._ft_kismet = QCheckBox(".kismet")
+        self._ft_kismet.setChecked(True)
+        ft_layout.addWidget(self._ft_kismet)
+        self._ft_pcap = QCheckBox(".pcap")
+        self._ft_pcap.setChecked(True)
+        ft_layout.addWidget(self._ft_pcap)
+        self._ft_wigle = QCheckBox(".wiglecsv")
+        self._ft_wigle.setChecked(True)
+        ft_layout.addWidget(self._ft_wigle)
+        self._ft_hash = QCheckBox(".22000")
+        self._ft_hash.setChecked(True)
+        ft_layout.addWidget(self._ft_hash)
+        ft_layout.addStretch()
+        layout.addLayout(ft_layout)
+
         # Progress
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
@@ -765,10 +808,21 @@ class ConnectDialog(QDialog):
         checked_sources = [sw for sw in self._source_widgets
                            if sw.check.isChecked() and sw._online]
 
+        pull_extensions = set()
+        if self._ft_kismet.isChecked():
+            pull_extensions.add('.kismet')
+        if self._ft_pcap.isChecked():
+            pull_extensions.update({'.pcap', '.pcapng', '.cap'})
+        if self._ft_wigle.isChecked():
+            pull_extensions.add('.wiglecsv')
+        if self._ft_hash.isChecked():
+            pull_extensions.update({'.hc22000', '.22000'})
+
         self._pull_worker = _PullWorker(
             checked_sources, self._local_files,
             self._only_new_check.isChecked(),
-            self._delete_after_check.isChecked()
+            self._delete_after_check.isChecked(),
+            pull_extensions or None,
         )
         self._pull_worker.progress.connect(self._on_pull_progress)
         self._pull_worker.file_pulled.connect(self._on_file_pulled)
