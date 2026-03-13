@@ -21,6 +21,7 @@ from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyM
 from PyQt6.QtGui import QColor, QBrush, QAction, QCursor
 
 from config import DEFAULT_CONFIG
+from ui.device_table import add_to_blocklist, add_to_watchlist
 
 try:
     import pyqtgraph as pg
@@ -2240,6 +2241,8 @@ class NetworksView(QWidget):
         self._ap_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._ap_table.setAlternatingRowColors(True)
         self._ap_table.setMaximumHeight(200)
+        self._ap_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._ap_table.customContextMenuRequested.connect(self._ap_context_menu)
         detail.addWidget(self._ap_table)
 
         # --- Probing Clients section (PCAP only) ---
@@ -2608,9 +2611,37 @@ class NetworksView(QWidget):
         try:
             if address and row_idx < self._ssid_table.rowCount():
                 self._ssid_table.setItem(row_idx, 2, QTableWidgetItem(address))
-                # Update the lookup so future repopulations use the address
                 ssid_item = self._ssid_table.item(row_idx, 0)
                 if ssid_item:
                     self._ssid_locations[ssid_item.text()] = address
         except RuntimeError:
             pass
+
+    def _ap_context_menu(self, position):
+        row = self._ap_table.rowAt(position.y())
+        if row < 0:
+            return
+        bssid_item = self._ap_table.item(row, 0)
+        if not bssid_item:
+            return
+        mac = bssid_item.text()
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copy BSSID")
+        block_action = menu.addAction("Add to MAC Blocklist")
+        watch_action = menu.addAction("Add to Watchlist")
+        action = menu.exec(self._ap_table.viewport().mapToGlobal(position))
+        manuf_item = self._ap_table.item(row, 1)
+        label = f"{manuf_item.text()} ({mac})" if manuf_item else ""
+        from PyQt6.QtWidgets import QMessageBox
+        if action == copy_action:
+            QApplication.clipboard().setText(mac)
+        elif action == block_action:
+            if add_to_blocklist(mac, label):
+                QMessageBox.information(self, "Blocklist", f"Added {mac} to MAC blocklist.")
+            else:
+                QMessageBox.information(self, "Blocklist", f"{mac} is already in the blocklist.")
+        elif action == watch_action:
+            if add_to_watchlist(mac, label):
+                QMessageBox.information(self, "Watchlist", f"Added {mac} to watchlist.")
+            else:
+                QMessageBox.information(self, "Watchlist", f"{mac} is already on the watchlist.")

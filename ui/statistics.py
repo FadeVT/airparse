@@ -287,7 +287,9 @@ class StatisticsPanel(QWidget):
     # --- Public update interface (called by main_window.py) ---
 
     def update_statistics(self, summary: dict, networks_df: pd.DataFrame = None,
-                          signal_df: pd.DataFrame = None):
+                          signal_df: pd.DataFrame = None,
+                          ap_df: pd.DataFrame = None,
+                          client_df: pd.DataFrame = None):
         """Update haul bar and highlights from summary dict."""
         phy_counts = summary.get('by_phy_type', {})
         wifi_count = phy_counts.get('IEEE802.11', 0)
@@ -309,6 +311,38 @@ class StatisticsPanel(QWidget):
                 top_ssid = networks_df.iloc[0]['ssid'] if len(networks_df) > 0 else '-'
                 top_count = networks_df.iloc[0]['ap_count'] if len(networks_df) > 0 else 0
                 self.hl_most_probed.set_value(f"{top_ssid} ({top_count} APs)")
+
+        if self._is_pcap:
+            return
+
+        # Kismet DB highlights — populate from AP/client DataFrames
+        if client_df is not None:
+            self.haul_clients.set_value(str(len(client_df)))
+
+        if ap_df is not None and not ap_df.empty:
+            if 'strongest_signal' in ap_df.columns:
+                valid_sig = ap_df[ap_df['strongest_signal'].notna() & (ap_df['strongest_signal'] != 0)]
+                if not valid_sig.empty:
+                    best_row = valid_sig.loc[valid_sig['strongest_signal'].idxmax()]
+                    sig = int(best_row['strongest_signal'])
+                    name = best_row.get('name', '') or best_row.get('devmac', 'Unknown')
+                    self.hl_strongest.set_value(f"{sig} dBm — {name}")
+
+            if 'encryption' in ap_df.columns:
+                enc_counts = ap_df['encryption'].value_counts()
+                parts = [f"{enc}: {cnt}" for enc, cnt in enc_counts.items()]
+                self.hl_encryption.set_value(" | ".join(parts))
+
+        if networks_df is not None and not networks_df.empty:
+            if 'ap_count' in networks_df.columns:
+                rare = networks_df[networks_df['ap_count'] == 1]
+                if not rare.empty:
+                    self.hl_rarest.set_value(f"{rare.iloc[0]['ssid']} (unique to 1 AP)")
+                else:
+                    least = networks_df.iloc[-1]
+                    self.hl_rarest.set_value(f"{least['ssid']} ({least['ap_count']} APs)")
+
+        self.hl_handshakes.set_value("N/A (Kismet DB)")
 
     def show_mini_map(self, devices_df: pd.DataFrame, gps_df: pd.DataFrame = None):
         """Plot device dots on the hero map (no track lines, dots only)."""

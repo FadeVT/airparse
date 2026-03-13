@@ -299,6 +299,7 @@ class ControlView(QWidget):
     PAGE_KISMET_FILES = 1
     PAGE_PAGER_FILES = 2
     PAGE_LOCAL_STORAGE = 3
+    PAGE_FILTERS = 4
 
     def _setup_ui(self):
         outer = QVBoxLayout(self)
@@ -309,6 +310,7 @@ class ControlView(QWidget):
         self._pages.addWidget(self._build_kismet_files_page())
         self._pages.addWidget(self._build_pager_files_page())
         self._pages.addWidget(self._build_local_storage_page())
+        self._pages.addWidget(self._build_filters_page())
 
         outer.addWidget(self._pages)
 
@@ -592,6 +594,118 @@ class ControlView(QWidget):
         layout.addLayout(btn_row)
 
         return page
+
+    def _build_filters_page(self) -> QWidget:
+        from ui.wigle_view import WigleView
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(16)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        header = QLabel("MAC Filter Lists")
+        header.setFont(QFont('Segoe UI', 13, QFont.Weight.Bold))
+        header.setStyleSheet(_LABEL_STYLE)
+        layout.addWidget(header)
+
+        desc = QLabel(
+            "Manage MAC address filter lists used across AirParse. "
+            "The blocklist strips devices from WiGLE uploads and Kismet captures. "
+            "The watchlist highlights devices of interest in device tables."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(_DIM_STYLE)
+        layout.addWidget(desc)
+
+        # --- Blocklist card ---
+        block_card = QFrame()
+        block_card.setStyleSheet(_CARD_STYLE)
+        block_layout = QVBoxLayout(block_card)
+
+        block_title = QLabel("Blocklist")
+        block_title.setFont(QFont('Segoe UI', 12, QFont.Weight.Bold))
+        block_title.setStyleSheet(_LABEL_STYLE)
+        block_layout.addWidget(block_title)
+
+        block_desc = QLabel(
+            "Devices filtered from WiGLE CSV uploads and Kismet capture logging. "
+            "Your travel kit (car WiFi, router, RPi, phones) goes here."
+        )
+        block_desc.setWordWrap(True)
+        block_desc.setStyleSheet(_DIM_STYLE)
+        block_layout.addWidget(block_desc)
+
+        self._block_count_label = QLabel()
+        self._block_count_label.setStyleSheet(_LABEL_STYLE)
+        block_layout.addWidget(self._block_count_label)
+
+        block_btn_row = QHBoxLayout()
+        edit_block_btn = _action_btn("Edit Blocklist", "#8e44ad", "white", bold=True)
+        edit_block_btn.clicked.connect(lambda: self._open_list_editor('blocklist'))
+        block_btn_row.addWidget(edit_block_btn)
+        block_btn_row.addStretch()
+        block_layout.addLayout(block_btn_row)
+
+        layout.addWidget(block_card)
+
+        # --- Watchlist card ---
+        watch_card = QFrame()
+        watch_card.setStyleSheet(_CARD_STYLE)
+        watch_layout = QVBoxLayout(watch_card)
+
+        watch_title = QLabel("Watchlist")
+        watch_title.setFont(QFont('Segoe UI', 12, QFont.Weight.Bold))
+        watch_title.setStyleSheet(_LABEL_STYLE)
+        watch_layout.addWidget(watch_title)
+
+        watch_desc = QLabel(
+            "Devices highlighted in orange across all device tables. "
+            "Use this for OUIs or MACs you want to track — interesting vendors, "
+            "known targets, or devices of interest."
+        )
+        watch_desc.setWordWrap(True)
+        watch_desc.setStyleSheet(_DIM_STYLE)
+        watch_layout.addWidget(watch_desc)
+
+        self._watch_count_label = QLabel()
+        self._watch_count_label.setStyleSheet(_LABEL_STYLE)
+        watch_layout.addWidget(self._watch_count_label)
+
+        watch_btn_row = QHBoxLayout()
+        edit_watch_btn = _action_btn("Edit Watchlist", "#e67e22", "white", bold=True)
+        edit_watch_btn.clicked.connect(lambda: self._open_list_editor('watchlist'))
+        watch_btn_row.addWidget(edit_watch_btn)
+        watch_btn_row.addStretch()
+        watch_layout.addLayout(watch_btn_row)
+
+        layout.addWidget(watch_card)
+        layout.addStretch()
+
+        self._refresh_filter_counts()
+        return page
+
+    def _refresh_filter_counts(self):
+        from ui.wigle_view import WigleView
+        bl = WigleView._parse_list_file(WigleView._BLOCKLIST_PATH)
+        wl = WigleView._parse_list_file(WigleView._WATCHLIST_PATH)
+        if hasattr(self, '_block_count_label'):
+            full = sum(1 for _, _, t in bl if t == "Full MAC")
+            oui = sum(1 for _, _, t in bl if t == "OUI Prefix")
+            self._block_count_label.setText(f"{len(bl)} entries ({full} MACs, {oui} OUI prefixes)")
+        if hasattr(self, '_watch_count_label'):
+            full = sum(1 for _, _, t in wl if t == "Full MAC")
+            oui = sum(1 for _, _, t in wl if t == "OUI Prefix")
+            self._watch_count_label.setText(f"{len(wl)} entries ({full} MACs, {oui} OUI prefixes)")
+
+    def _open_list_editor(self, which: str):
+        from ui.wigle_view import WigleView
+        view = WigleView.__new__(WigleView)
+        QWidget.__init__(view, self)
+        if which == 'blocklist':
+            view._show_blocklist_editor()
+        else:
+            view._show_watchlist_editor()
+        self._refresh_filter_counts()
 
     def scroll_to_section(self, object_name: str):
         for i in range(self._pages.count()):

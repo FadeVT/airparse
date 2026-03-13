@@ -10,7 +10,9 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QGroupBox, QScrollArea, QStackedWidget, QTreeWidget,
     QTreeWidgetItem, QHeaderView, QFileDialog, QProgressBar,
-    QLineEdit, QDateEdit, QCheckBox, QSizePolicy
+    QLineEdit, QDateEdit, QCheckBox, QSizePolicy, QDialog,
+    QTextEdit, QMessageBox, QTableWidget, QTableWidgetItem,
+    QAbstractItemView
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QDate
 from PyQt6.QtGui import QFont, QColor
@@ -474,6 +476,10 @@ class WigleView(QWidget):
         self._scan_local_btn = _action_btn("Scan Staged Files")
         self._scan_local_btn.clicked.connect(self._scan_local_wiglecsv)
         upload_btn_row.addWidget(self._scan_local_btn)
+        self._filter_btn = _action_btn("Filter Staged", "#8e44ad", "white")
+        self._filter_btn.setToolTip("Strip blocked MACs from staged CSVs before upload")
+        self._filter_btn.clicked.connect(self._filter_staged_files)
+        upload_btn_row.addWidget(self._filter_btn)
         upload_btn_row.addStretch()
         self._upload_btn = _action_btn("Upload Selected", "#27ae60", "white", bold=True)
         self._upload_btn.clicked.connect(self._upload_selected)
@@ -905,6 +911,464 @@ class WigleView(QWidget):
                 shutil.move(str(p), str(uploaded_dir / p.name))
             except Exception as e:
                 log.warning("Failed to move uploaded file %s: %s", p.name, e)
+
+    # ─── MAC Blocklist Filter ─────────────────────────────────────────
+
+    _BLOCKLIST_PATH = Path.home() / '.config' / 'airparse' / 'mac_blocklist.txt'
+    _WATCHLIST_PATH = Path.home() / '.config' / 'airparse' / 'mac_watchlist.txt'
+
+    @staticmethod
+    def _load_blocklist() -> tuple[set[str], list[str]]:
+        """Load blocklist. Returns (full_macs, oui_prefixes)."""
+        bp = WigleView._BLOCKLIST_PATH
+        full = set()
+        prefixes = []
+        if not bp.exists():
+            return full, prefixes
+        for line in bp.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            entry = line.upper()
+            if len(entry) <= 8:
+                prefixes.append(entry)
+            else:
+                full.add(entry)
+        return full, prefixes
+
+    @staticmethod
+    def _mac_blocked(mac: str, full_macs: set[str], prefixes: list[str]) -> bool:
+        if mac in full_macs:
+            return True
+        for pfx in prefixes:
+            if mac.startswith(pfx):
+                return True
+        return False
+
+    def _filter_staged_files(self):
+        full, prefixes = self._load_blocklist()
+        if not full and not prefixes:
+            self._filter_btn.setText("No blocklist found")
+            QTimer.singleShot(2000, lambda: self._filter_btn.setText("Filter Staged"))
+            return
+
+        files = []
+        for i in range(self._upload_tree.topLevelItemCount()):
+            item = self._upload_tree.topLevelItem(i)
+            if item.checkState(0) == Qt.CheckState.Checked and item.text(2) == "Ready":
+                files.append((i, item.data(0, Qt.ItemDataRole.UserRole)))
+
+        if not files:
+            self._filter_btn.setText("No files to filter")
+            QTimer.singleShot(2000, lambda: self._filter_btn.setText("Filter Staged"))
+            return
+
+        total_removed = 0
+        total_kept = 0
+        for idx, fp in files:
+            removed, kept = self._filter_csv_file(fp, full, prefixes)
+            total_removed += removed
+            total_kept += kept
+            item = self._upload_tree.topLevelItem(idx)
+            new_size = Path(fp).stat().st_size if Path(fp).exists() else 0
+            item.setText(1, _fmt_bytes(new_size))
+
+        msg = f"Removed {total_removed:,} rows ({total_kept:,} kept)"
+        log.info("WiGLE filter: %s", msg)
+        self._filter_btn.setText(msg)
+        QTimer.singleShot(4000, lambda: self._filter_btn.setText("Filter Staged"))
+
+    @staticmethod
+    def _filter_csv_file(file_path: str, full_macs: set[str], prefixes: list[str]) -> tuple[int, int]:
+        p = Path(file_path)
+        lines = p.read_text().splitlines()
+        if len(lines) < 3:
+            return 0, 0
+
+        header_line = lines[0]
+        column_line = lines[1]
+        data_lines = lines[2:]
+
+        kept = []
+        removed = 0
+        for line in data_lines:
+            mac = line.split(',', 1)[0].upper()
+            if WigleView._mac_blocked(mac, full_macs, prefixes):
+                removed += 1
+            else:
+                kept.append(line)
+
+        p.write_text(header_line + '\n' + column_line + '\n' + '\n'.join(kept) + '\n')
+        return removed, len(kept)
+
+    _HEADER_SKIP = ('AirParse', 'One MAC', 'OUI prefix', 'These MACs', 'Matching devices')
+
+    @staticmethod
+    def _parse_list_file(path: Path) -> list[tuple[str, str, str]]:
+        """Parse a MAC list file into (mac, label, type) tuples."""
+        if not path.exists():
+            return []
+        entries = []
+        pending_comment = ""
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped:
+                pending_comment = ""
+                continue
+            if stripped.startswith('#'):
+                text = stripped.lstrip('#').strip()
+                if text and not any(text.startswith(k) for k in WigleView._HEADER_SKIP):
+                    pending_comment = text
+                continue
+            mac = stripped.upper()
+            typ = "OUI Prefix" if len(mac) <= 8 else "Full MAC"
+            entries.append((mac, pending_comment, typ))
+            pending_comment = ""
+        return entries
+
+    @staticmethod
+    def _save_list_entries(path: Path, header: str, entries: list[tuple[str, str, str]]):
+        """Write entries back to a MAC list file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [header, ""]
+        for mac, label, _ in entries:
+            if label:
+                lines.append(f"# {label}")
+            lines.append(mac)
+        lines.append("")
+        path.write_text('\n'.join(lines))
+
+    @staticmethod
+    def _parse_blocklist_file() -> list[tuple[str, str, str]]:
+        return WigleView._parse_list_file(WigleView._BLOCKLIST_PATH)
+
+    @staticmethod
+    def _save_blocklist_entries(entries: list[tuple[str, str, str]]):
+        WigleView._save_list_entries(
+            WigleView._BLOCKLIST_PATH,
+            "# AirParse MAC Blocklist\n"
+            "# One MAC per line (case-insensitive). Lines starting with # are comments.\n"
+            '# OUI prefix matching: use partial MACs like "94:83:C4" to match all devices from that vendor.\n'
+            "# These MACs are stripped from WiGLE CSVs before upload.",
+            entries,
+        )
+
+    def _show_list_editor(self, *, title: str, list_path: Path, header: str,
+                          save_fn, extra_buttons: list = None):
+        """Shared MAC list editor dialog for blocklist/watchlist."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumSize(620, 480)
+        dlg.setStyleSheet("background-color: #1e1e1e; color: #e0e0e0;")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        _tbl_style = """
+            QTableWidget {
+                background-color: #2b2b2b; color: #e0e0e0;
+                border: 1px solid #444; border-radius: 4px;
+                gridline-color: #3a3a3a; font-family: monospace; font-size: 12px;
+                alternate-background-color: #313131;
+            }
+            QTableWidget::item:selected { background-color: #2980b9; }
+            QHeaderView::section {
+                background-color: #333; color: #e0e0e0; padding: 4px 8px;
+                border: none; border-bottom: 1px solid #555; font-weight: bold;
+            }
+        """
+        _btn_style = (
+            "QPushButton {{ background-color: {bg}; color: {fg}; padding: 5px 14px;"
+            " border-radius: 4px; font-weight: bold; }}"
+            "QPushButton:hover {{ background-color: {hover}; }}"
+        )
+
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["MAC / OUI", "Label", "Type"])
+        table.setStyleSheet(_tbl_style)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+
+        entries = self._parse_list_file(list_path)
+
+        def _populate():
+            table.setRowCount(len(entries))
+            for i, (mac, label, typ) in enumerate(entries):
+                mac_item = QTableWidgetItem(mac)
+                mac_item.setFlags(mac_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                label_item = QTableWidgetItem(label)
+                type_item = QTableWidgetItem(typ)
+                type_item.setFlags(type_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if typ == "OUI Prefix":
+                    type_item.setForeground(QColor("#f39c12"))
+                else:
+                    type_item.setForeground(QColor("#999"))
+                table.setItem(i, 0, mac_item)
+                table.setItem(i, 1, label_item)
+                table.setItem(i, 2, type_item)
+
+        _populate()
+        layout.addWidget(table)
+
+        add_row = QHBoxLayout()
+        mac_input = QLineEdit()
+        mac_input.setPlaceholderText("MAC address or OUI prefix (e.g. AA:BB:CC:DD:EE:FF or AA:BB:CC)")
+        mac_input.setStyleSheet(
+            "QLineEdit { background-color: #2b2b2b; color: #e0e0e0; border: 1px solid #444;"
+            " border-radius: 4px; padding: 5px 8px; font-family: monospace; }"
+        )
+        label_input = QLineEdit()
+        label_input.setPlaceholderText("Label (optional)")
+        label_input.setStyleSheet(mac_input.styleSheet())
+        label_input.setMaximumWidth(180)
+
+        add_btn = QPushButton("Add")
+        add_btn.setStyleSheet(_btn_style.format(bg="#2ecc71", fg="white", hover="#27ae60"))
+
+        add_row.addWidget(mac_input, 3)
+        add_row.addWidget(label_input, 2)
+        add_row.addWidget(add_btn)
+        layout.addLayout(add_row)
+
+        def _add():
+            raw = mac_input.text().strip().upper()
+            if not raw:
+                return
+            for existing_mac, _, _ in entries:
+                if existing_mac == raw:
+                    mac_input.setText("")
+                    mac_input.setPlaceholderText("Already in list")
+                    QTimer.singleShot(2000, lambda: mac_input.setPlaceholderText(
+                        "MAC address or OUI prefix (e.g. AA:BB:CC:DD:EE:FF or AA:BB:CC)"))
+                    return
+            typ = "OUI Prefix" if len(raw) <= 8 else "Full MAC"
+            lbl = label_input.text().strip()
+            entries.append((raw, lbl, typ))
+            _populate()
+            mac_input.setText("")
+            label_input.setText("")
+            count_label.setText(f"{len(entries)} entries")
+
+        add_btn.clicked.connect(_add)
+        mac_input.returnPressed.connect(_add)
+
+        bottom_row = QHBoxLayout()
+
+        count_label = QLabel(f"{len(entries)} entries")
+        count_label.setStyleSheet(_DIM_STYLE)
+        bottom_row.addWidget(count_label)
+
+        bottom_row.addStretch()
+
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.setStyleSheet(_btn_style.format(bg="#c0392b", fg="white", hover="#a93226"))
+        bottom_row.addWidget(remove_btn)
+
+        if extra_buttons:
+            for btn in extra_buttons:
+                btn.setStyleSheet(_btn_style.format(bg="#2980b9", fg="white", hover="#2471a3"))
+                bottom_row.addWidget(btn)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(_btn_style.format(bg="#555", fg="#e0e0e0", hover="#666"))
+        bottom_row.addWidget(cancel_btn)
+
+        save_btn = QPushButton("Save")
+        save_btn.setStyleSheet(_btn_style.format(bg="#2ecc71", fg="white", hover="#27ae60"))
+        bottom_row.addWidget(save_btn)
+
+        layout.addLayout(bottom_row)
+
+        def _remove():
+            rows = sorted(set(idx.row() for idx in table.selectedIndexes()), reverse=True)
+            for r in rows:
+                entries.pop(r)
+            _populate()
+            count_label.setText(f"{len(entries)} entries")
+
+        def _collect():
+            for i in range(len(entries)):
+                lbl_item = table.item(i, 1)
+                if lbl_item:
+                    entries[i] = (entries[i][0], lbl_item.text().strip(), entries[i][2])
+            return entries
+
+        def _save():
+            _collect()
+            save_fn(entries)
+            dlg.accept()
+
+        remove_btn.clicked.connect(_remove)
+        cancel_btn.clicked.connect(dlg.reject)
+        save_btn.clicked.connect(_save)
+
+        dlg._entries = entries
+        dlg._collect = _collect
+        dlg._btn_style = _btn_style
+        dlg.exec()
+
+    def _show_blocklist_editor(self):
+        sync_btn = QPushButton("Sync to Kismet")
+        sync_btn.setToolTip("Push blocklist filters to Kismet RPi5 config")
+
+        dlg_ref = {}
+
+        def _on_sync():
+            sync_btn.setEnabled(False)
+            sync_btn.setText("Syncing...")
+            try:
+                parent = sync_btn.parent()
+                while parent and not isinstance(parent, QDialog):
+                    parent = parent.parent()
+                entries = parent._collect() if parent else []
+                self._save_blocklist_entries(entries)
+                result = self._sync_blocklist_to_kismet(entries)
+                sync_btn.setText(result)
+                QTimer.singleShot(3000, lambda: (
+                    sync_btn.setText("Sync to Kismet"),
+                    sync_btn.setEnabled(True),
+                ))
+            except Exception as e:
+                log.error("Kismet sync failed: %s", e)
+                sync_btn.setText("Sync Failed")
+                sync_btn.setEnabled(True)
+                QTimer.singleShot(3000, lambda: sync_btn.setText("Sync to Kismet"))
+
+        sync_btn.clicked.connect(_on_sync)
+
+        self._show_list_editor(
+            title="MAC Blocklist Editor",
+            list_path=self._BLOCKLIST_PATH,
+            header=(
+                "# AirParse MAC Blocklist\n"
+                "# One MAC per line (case-insensitive). Lines starting with # are comments.\n"
+                '# OUI prefix matching: use partial MACs like "94:83:C4" to match all devices from that vendor.\n'
+                "# These MACs are stripped from WiGLE CSVs before upload."
+            ),
+            save_fn=self._save_blocklist_entries,
+            extra_buttons=[sync_btn],
+        )
+
+    def _show_watchlist_editor(self):
+        self._show_list_editor(
+            title="MAC Watchlist Editor",
+            list_path=self._WATCHLIST_PATH,
+            header=(
+                "# AirParse MAC Watchlist\n"
+                "# Matching devices are highlighted in orange in device tables.\n"
+                '# OUI prefix matching: use partial MACs like "00:30:44" to match all devices from that vendor.'
+            ),
+            save_fn=lambda entries: self._save_list_entries(
+                self._WATCHLIST_PATH,
+                "# AirParse MAC Watchlist\n"
+                "# Matching devices are highlighted in orange in device tables.\n"
+                '# OUI prefix matching: use partial MACs like "00:30:44" to match all devices from that vendor.',
+                entries,
+            ),
+        )
+
+    @staticmethod
+    def _generate_kismet_filters(entries: list[tuple[str, str, str]]) -> str:
+        """Generate kismet_site.conf filter lines from blocklist entries."""
+        lines = [
+            "",
+            "# --------------------------------------------------",
+            "# MAC Blocklist — synced from AirParse",
+            "# --------------------------------------------------",
+            "",
+        ]
+        for mac, label, typ in entries:
+            if label:
+                lines.append(f"# {label}")
+            if typ == "OUI Prefix":
+                oui = mac.upper()
+                mask_addr = f"{oui}:00:00:00/FF:FF:FF:00:00:00"
+                lines.append(f"kis_log_device_filter=IEEE802.11,{mask_addr},block")
+                lines.append(f"kis_log_packet_filter=IEEE802.11,any,{mask_addr},block")
+            else:
+                lines.append(f"kis_log_device_filter=IEEE802.11,{mac},block")
+                lines.append(f"kis_log_packet_filter=IEEE802.11,any,{mac},block")
+        lines.append("")
+        return '\n'.join(lines)
+
+    def _sync_blocklist_to_kismet(self, entries: list[tuple[str, str, str]]) -> str:
+        """SSH to the Kismet RPi5 and update kismet_site.conf filters."""
+        import paramiko
+        from sources import SOURCES_FILE, SourceConfig
+
+        sources_data = json.loads(SOURCES_FILE.read_text())
+        kismet_cfg = None
+        for s in sources_data.get('sources', []):
+            if s.get('type') == 'kismet':
+                kismet_cfg = SourceConfig.from_dict(s)
+                break
+
+        if not kismet_cfg:
+            return "No Kismet source configured"
+
+        conf_path = "/etc/kismet/kismet_site.conf"
+        filter_marker = "# MAC Blocklist — synced from AirParse"
+        old_marker = "# Travel Kit Filter"
+
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        key_path = Path(kismet_cfg.key_file).expanduser()
+        connect_kw = {
+            'hostname': kismet_cfg.host,
+            'port': kismet_cfg.port,
+            'username': kismet_cfg.user,
+            'timeout': 5,
+        }
+        if key_path.exists():
+            connect_kw['key_filename'] = str(key_path)
+
+        try:
+            ssh.connect(**connect_kw)
+
+            _, stdout, _ = ssh.exec_command(f"cat {conf_path}")
+            existing = stdout.read().decode()
+
+            kept_lines = []
+            in_filter_block = False
+            for line in existing.splitlines():
+                if filter_marker in line or old_marker in line:
+                    in_filter_block = True
+                    continue
+                if in_filter_block:
+                    if line.startswith('kis_log_device_filter=') or \
+                       line.startswith('kis_log_packet_filter=') or \
+                       line.startswith('#') or line.strip() == '':
+                        continue
+                    else:
+                        in_filter_block = False
+                kept_lines.append(line)
+
+            while kept_lines and kept_lines[-1].strip() == '':
+                kept_lines.pop()
+
+            new_filters = self._generate_kismet_filters(entries)
+            new_conf = '\n'.join(kept_lines) + '\n' + new_filters
+
+            escaped = new_conf.replace("'", "'\\''")
+            cmd = f"echo '{escaped}' | sudo tee {conf_path} > /dev/null"
+            _, stdout, stderr = ssh.exec_command(cmd)
+            exit_code = stdout.channel.recv_exit_status()
+
+            if exit_code != 0:
+                err = stderr.read().decode().strip()
+                return f"Write failed: {err}"
+
+            count = len(entries)
+            return f"Synced {count} filters to Kismet"
+        finally:
+            ssh.close()
 
     # ─── Transactions ────────────────────────────────────────────────
 

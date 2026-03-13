@@ -1,5 +1,6 @@
 """Reusable device table view widget."""
 
+from pathlib import Path
 from typing import Optional, Callable
 import pandas as pd
 
@@ -11,14 +12,93 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSortFilterProxyModel, QAbstractTableModel, QModelIndex, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QBrush
 
+_BLOCKLIST_PATH = Path.home() / '.config' / 'airparse' / 'mac_blocklist.txt'
+_WATCHLIST_PATH = Path.home() / '.config' / 'airparse' / 'mac_watchlist.txt'
+
+
+def _add_to_list_file(path: Path, mac: str, label: str = "") -> bool:
+    """Append a MAC to a list file. Returns True if added, False if already present."""
+    mac = mac.strip().upper()
+    if not mac:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = set()
+    if path.exists():
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith('#'):
+                existing.add(stripped.upper())
+    if mac in existing:
+        return False
+    with open(path, 'a') as f:
+        if label:
+            f.write(f"\n# {label}\n")
+        f.write(f"{mac}\n")
+    return True
+
+
+def add_to_blocklist(mac: str, label: str = "") -> bool:
+    return _add_to_list_file(_BLOCKLIST_PATH, mac, label)
+
+
+def add_to_watchlist(mac: str, label: str = "") -> bool:
+    return _add_to_list_file(_WATCHLIST_PATH, mac, label)
+
+
+def load_watchlist() -> tuple[set[str], list[str]]:
+    """Load watchlist. Returns (full_macs, oui_prefixes)."""
+    full = set()
+    prefixes = []
+    if not _WATCHLIST_PATH.exists():
+        return full, prefixes
+    for line in _WATCHLIST_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        entry = line.upper()
+        if len(entry) <= 8:
+            prefixes.append(entry)
+        else:
+            full.add(entry)
+    return full, prefixes
+
+
+_WATCHLIST_HIGHLIGHT = QColor(255, 165, 0, 45)  # orange tint, semi-transparent
+_WATCHLIST_FG = QColor(255, 180, 50)
+
 
 class PandasTableModel(QAbstractTableModel):
     """Table model for displaying pandas DataFrame."""
+
+    _MAC_COLS = ('devmac', 'client_mac', 'mac', 'bssid')
 
     def __init__(self, df: pd.DataFrame = None, parent=None):
         super().__init__(parent)
         self._df = df if df is not None else pd.DataFrame()
         self._original_df = self._df.copy()
+        self._watchlist_full: set[str] = set()
+        self._watchlist_prefixes: list[str] = []
+        self.refresh_watchlist()
+
+    def refresh_watchlist(self):
+        self._watchlist_full, self._watchlist_prefixes = load_watchlist()
+
+    def _row_on_watchlist(self, row: int) -> bool:
+        full_df = self._full_df if hasattr(self, '_full_df') else self._df
+        if not self._watchlist_full and not self._watchlist_prefixes:
+            return False
+        for col in self._MAC_COLS:
+            if col in full_df.columns:
+                val = full_df.iloc[row].get(col)
+                if pd.isna(val) or not val:
+                    continue
+                mac = str(val).upper()
+                if mac in self._watchlist_full:
+                    return True
+                for pfx in self._watchlist_prefixes:
+                    if mac.startswith(pfx):
+                        return True
+        return False
 
     def rowCount(self, parent=QModelIndex()):
         if parent.isValid():
@@ -50,25 +130,32 @@ class PandasTableModel(QAbstractTableModel):
             return str(value)
 
         elif role == Qt.ItemDataRole.BackgroundRole:
-            # Color code by signal strength if column exists
+            if self._row_on_watchlist(row):
+                return QBrush(_WATCHLIST_HIGHLIGHT)
             col_name = self._df.columns[col]
             if col_name == 'strongest_signal' and not pd.isna(value):
                 try:
                     signal = int(value)
                     if signal >= -50:
-                        return QBrush(QColor(144, 238, 144))  # Light green - excellent
+                        return QBrush(QColor(144, 238, 144))
                     elif signal >= -60:
-                        return QBrush(QColor(173, 255, 47))   # Green yellow - good
+                        return QBrush(QColor(173, 255, 47))
                     elif signal >= -70:
-                        return QBrush(QColor(255, 255, 150))  # Light yellow - fair
+                        return QBrush(QColor(255, 255, 150))
                     elif signal >= -80:
-                        return QBrush(QColor(255, 200, 150))  # Light orange - weak
+                        return QBrush(QColor(255, 200, 150))
                     else:
-                        return QBrush(QColor(255, 182, 193))  # Light pink - poor
+                        return QBrush(QColor(255, 182, 193))
                 except (ValueError, TypeError):
                     pass
 
+        elif role == Qt.ItemDataRole.ForegroundRole:
+            if self._row_on_watchlist(row):
+                return QBrush(_WATCHLIST_FG)
+
         elif role == Qt.ItemDataRole.ToolTipRole:
+            if self._row_on_watchlist(row):
+                return "⚠ Watchlist match"
             if pd.isna(value):
                 return "No data"
             return str(value)
@@ -224,6 +311,16 @@ class DeviceTableView(QWidget):
         self.export_selected_action.triggered.connect(self._export_selected)
         self.context_menu.addAction(self.export_selected_action)
 
+        self.context_menu.addSeparator()
+
+        self.block_mac_action = QAction("Add to MAC Blocklist", self)
+        self.block_mac_action.triggered.connect(self._add_to_blocklist)
+        self.context_menu.addAction(self.block_mac_action)
+
+        self.watch_mac_action = QAction("Add to Watchlist", self)
+        self.watch_mac_action.triggered.connect(self._add_to_watchlist)
+        self.context_menu.addAction(self.watch_mac_action)
+
     def set_extra_actions(self, actions: list):
         """Set additional context menu actions (e.g., PCAP-specific)."""
         # Remove old extra actions
@@ -378,6 +475,33 @@ class DeviceTableView(QWidget):
             "Export",
             f"Export {len(rows)} rows will be implemented in Phase 4."
         )
+
+    def _add_to_blocklist(self):
+        row_data = self._get_current_row()
+        mac = row_data.get('devmac') or row_data.get('client_mac', '')
+        if not mac:
+            return
+        name = row_data.get('name') or row_data.get('commonname') or ''
+        label = f"{name} ({mac})" if name else ""
+        if add_to_blocklist(str(mac), label):
+            self.table_view.viewport().update()
+            QMessageBox.information(self, "Blocklist", f"Added {mac} to MAC blocklist.")
+        else:
+            QMessageBox.information(self, "Blocklist", f"{mac} is already in the blocklist.")
+
+    def _add_to_watchlist(self):
+        row_data = self._get_current_row()
+        mac = row_data.get('devmac') or row_data.get('client_mac', '')
+        if not mac:
+            return
+        name = row_data.get('name') or row_data.get('commonname') or ''
+        label = f"{name} ({mac})" if name else ""
+        if add_to_watchlist(str(mac), label):
+            self._source_model.refresh_watchlist()
+            self.table_view.viewport().update()
+            QMessageBox.information(self, "Watchlist", f"Added {mac} to watchlist.")
+        else:
+            QMessageBox.information(self, "Watchlist", f"{mac} is already on the watchlist.")
 
     def _on_double_click(self, index):
         """Handle double-click on a row."""

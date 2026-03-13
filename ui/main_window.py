@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from sources import PULL_DIR
 from database.reader import KismetDBReader
 from database.pcap_reader import PcapReader
 from database.pcap_worker import PcapParseWorker
@@ -81,7 +82,11 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.tab_widget)
 
         # Set splitter sizes (sidebar:content — compact nav, wide content)
-        splitter.setSizes([150, 1050])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        self.sidebar.setMinimumWidth(150)
+        self.sidebar.setMaximumWidth(300)
+        splitter.setSizes([180, 1020])
 
     def _create_sidebar(self) -> QWidget:
         """Create the sidebar with navigation tree."""
@@ -160,6 +165,12 @@ class MainWindow(QMainWindow):
         pager_item.addChild(QTreeWidgetItem(["Recon Service"]))
         self.nav_tree.addTopLevelItem(pager_item)
         pager_item.setExpanded(True)
+
+        filters_item = QTreeWidgetItem(["MAC Filters"])
+        filters_item.addChild(QTreeWidgetItem(["Blocklist"]))
+        filters_item.addChild(QTreeWidgetItem(["Watchlist"]))
+        self.nav_tree.addTopLevelItem(filters_item)
+        filters_item.setExpanded(True)
 
         files_item = QTreeWidgetItem(["File Management"])
         files_item.addChild(QTreeWidgetItem(["Kismet RPi5"]))
@@ -301,10 +312,15 @@ class MainWindow(QMainWindow):
         # File menu
         file_menu = menubar.addMenu("&File")
 
-        open_action = QAction("&Open Database...", self)
+        open_action = QAction("&Open File...", self)
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.open_database)
         file_menu.addAction(open_action)
+
+        browse_pulls_action = QAction("Browse &Pulls...", self)
+        browse_pulls_action.setShortcut("Ctrl+P")
+        browse_pulls_action.triggered.connect(self._browse_pulls)
+        file_menu.addAction(browse_pulls_action)
 
         file_menu.addSeparator()
 
@@ -467,10 +483,11 @@ class MainWindow(QMainWindow):
 
     def open_database(self):
         """Open a Kismet database, PCAP file, or zip archive."""
+        start_dir = str(PULL_DIR) if PULL_DIR.exists() else ""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Capture File",
-            "",
+            start_dir,
             "All Supported (*.kismet *.pcap *.pcapng *.cap *.csv *.gz *.zip *.tar.gz *.tgz *.hc22000 *.22000);;"
             "Kismet Database (*.kismet);;"
             "PCAP Files (*.pcap *.pcapng *.cap);;"
@@ -485,6 +502,99 @@ class MainWindow(QMainWindow):
             return
 
         self._open_file_by_type(file_path)
+
+    def _browse_pulls(self):
+        """Show pulled files organized by source for quick opening."""
+        if not PULL_DIR.exists() or not any(PULL_DIR.iterdir()):
+            QMessageBox.information(self, "No Pulls",
+                                    f"No pulled files found.\n\n"
+                                    f"Pull directory: {PULL_DIR}")
+            return
+
+        from PyQt6.QtWidgets import (
+            QDialog, QDialogButtonBox, QTreeWidget, QTreeWidgetItem,
+            QVBoxLayout, QLabel, QHeaderView,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Browse Pulled Files")
+        dlg.setMinimumSize(700, 500)
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel(f"Pull directory: {PULL_DIR}"))
+
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["Name", "Size", "Modified"])
+        tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        tree.setAlternatingRowColors(True)
+
+        OPENABLE = {'.kismet', '.pcap', '.pcapng', '.cap', '.csv', '.wiglecsv',
+                     '.hc22000', '.22000', '.gz', '.zip', '.tgz'}
+
+        for source_dir in sorted(PULL_DIR.iterdir()):
+            if not source_dir.is_dir():
+                continue
+            source_item = QTreeWidgetItem([source_dir.name, "", ""])
+            source_item.setExpanded(True)
+
+            for f in sorted(source_dir.rglob("*")):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(source_dir)
+                size = f.stat().st_size
+                if size >= 1_073_741_824:
+                    size_str = f"{size / 1_073_741_824:.1f} GB"
+                elif size >= 1_048_576:
+                    size_str = f"{size / 1_048_576:.1f} MB"
+                elif size >= 1024:
+                    size_str = f"{size / 1024:.1f} KB"
+                else:
+                    size_str = f"{size} B"
+
+                from datetime import datetime
+                mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+
+                file_item = QTreeWidgetItem([str(rel), size_str, mtime])
+                file_item.setData(0, Qt.ItemDataRole.UserRole, str(f))
+
+                ext = f.suffix.lower()
+                if f.name.lower().endswith('.tar.gz'):
+                    ext = '.tgz'
+                if ext not in OPENABLE:
+                    file_item.setDisabled(True)
+
+                source_item.addChild(file_item)
+
+            tree.addTopLevelItem(source_item)
+
+        tree.itemDoubleClicked.connect(lambda item, col: self._open_pulls_selection(tree, dlg))
+        layout.addWidget(tree, 1)
+
+        buttons = QDialogButtonBox()
+        open_btn = buttons.addButton("Open Selected", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dlg.reject)
+
+        open_btn.clicked.connect(lambda: self._open_pulls_selection(tree, dlg))
+
+        layout.addWidget(buttons)
+        dlg.exec()
+
+    def _open_pulls_selection(self, tree, dlg):
+        """Open all selected files from the pulls browser."""
+        paths = []
+        for item in tree.selectedItems():
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path:
+                paths.append(path)
+        if not paths:
+            return
+        dlg.accept()
+        for path in paths:
+            self._open_file_by_type(path)
 
     def _on_connect(self):
         """Open the Connect dialog to pull data from remote devices."""
@@ -1054,8 +1164,14 @@ class MainWindow(QMainWindow):
         networks_df = self.db_reader.get_networks()
         signal_df = self.db_reader.get_signal_distribution()
 
+        # Get separate AP and client counts
+        ap_df = self.db_reader.get_access_points()
+        client_df = self.db_reader.get_clients()
+
         # Update statistics panel
-        self.statistics_panel.update_statistics(summary, networks_df, signal_df)
+        self.statistics_panel.update_statistics(
+            summary, networks_df, signal_df, ap_df=ap_df, client_df=client_df
+        )
 
         # Update additional counts
         alerts_df = self.db_reader.get_alerts()
@@ -1064,9 +1180,6 @@ class MainWindow(QMainWindow):
         datasources_df = self.db_reader.get_data_sources()
         self.statistics_panel.set_data_source_count(len(datasources_df))
 
-        # Get separate AP and client counts
-        ap_df = self.db_reader.get_access_points()
-        client_df = self.db_reader.get_clients()
         self.statistics_panel.set_wifi_counts(len(ap_df), len(client_df))
 
         # Show PCAP-specific stats if applicable
@@ -1115,6 +1228,15 @@ class MainWindow(QMainWindow):
         if current_tab == 1:
             parent = item.parent()
             parent_text = parent.text(0) if parent else ""
+
+            # MAC Filters section
+            if parent_text == "MAC Filters" or item_text == "MAC Filters":
+                self.control_view.show_page(ControlView.PAGE_FILTERS)
+                if item_text == "Blocklist":
+                    self.control_view._open_list_editor('blocklist')
+                elif item_text == "Watchlist":
+                    self.control_view._open_list_editor('watchlist')
+                return
 
             # File Management section
             if parent_text == "File Management" or item_text == "File Management":
