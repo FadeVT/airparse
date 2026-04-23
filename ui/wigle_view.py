@@ -12,10 +12,10 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem, QHeaderView, QFileDialog, QProgressBar,
     QLineEdit, QDateEdit, QCheckBox, QSizePolicy, QDialog,
     QTextEdit, QMessageBox, QTableWidget, QTableWidgetItem,
-    QAbstractItemView
+    QAbstractItemView, QMenu, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QDate
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QFont, QColor, QAction
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -27,7 +27,7 @@ from database.wigle_api import WigleApiClient
 
 log = logging.getLogger(__name__)
 
-_KML_DIR = Path.home() / '.config' / 'airparse' / 'kml'
+_KML_DIR = Path.home() / 'AirParse' / 'Wigle'
 _STAGE_DIR = Path.home() / '.config' / 'airparse' / 'wigle_uploads'
 _IGNORED_PATH = Path.home() / '.config' / 'airparse' / 'wigle_ignored_transids.json'
 
@@ -170,6 +170,7 @@ def _make_tx_tree() -> QTreeWidget:
     tree.setAlternatingRowColors(True)
     tree.setStyleSheet(_TREE_STYLE)
     tree.setRootIsDecorated(False)
+    tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
     h = tree.header()
     h.setStretchLastSection(False)
     h.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
@@ -250,7 +251,10 @@ class _KmlParseWorker(QThread):
 
 
 class _KmlBatchWorker(QThread):
-    file_done = pyqtSignal(str, bool)
+    # status: "ok" (new file written or already present), "empty" (server
+    # returned 0 bytes — transaction has no content), "error" (HTTP error,
+    # timeout, etc. — transient, worth retrying later).
+    file_done = pyqtSignal(str, str)
     all_done = pyqtSignal(int)
     def __init__(self, transids: list[str]):
         super().__init__()
@@ -266,7 +270,7 @@ class _KmlBatchWorker(QThread):
                 break
             out = _KML_DIR / f"{tid}.kml"
             if out.exists():
-                self.file_done.emit(tid, True)
+                self.file_done.emit(tid, "ok")
                 downloaded += 1
                 continue
             ok, data = client.download_kml(tid)
@@ -276,8 +280,57 @@ class _KmlBatchWorker(QThread):
                 _KML_DIR.mkdir(parents=True, exist_ok=True)
                 out.write_bytes(data)
                 downloaded += 1
-            self.file_done.emit(tid, ok and bool(data))
+                status = "ok"
+            elif ok:
+                status = "empty"
+            else:
+                status = "error"
+            self.file_done.emit(tid, status)
         self.all_done.emit(downloaded)
+
+
+class _KmlMergeWorker(QThread):
+    progress = pyqtSignal(str)
+    finished_ok = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, years: set[str] | None = None):
+        super().__init__()
+        self._years = years
+
+    def run(self):
+        try:
+            results = _merge_kmls_by_year(
+                _KML_DIR, Path.home() / 'Downloads',
+                progress_cb=self.progress.emit,
+                years=self._years,
+            )
+            self.finished_ok.emit(results)
+        except Exception as e:
+            log.exception("QGIS export failed")
+            self.failed.emit(str(e))
+
+
+class _KmlSelectedMergeWorker(QThread):
+    """Merge a user-chosen subset of KMLs (by transid) into one file."""
+    progress = pyqtSignal(str)
+    finished_ok = pyqtSignal(Path, int, int)  # out_path, placemarks, files_used
+    failed = pyqtSignal(str)
+
+    def __init__(self, files: list[Path], out_path: Path, label: str):
+        super().__init__()
+        self._files = files
+        self._out_path = out_path
+        self._label = label
+
+    def run(self):
+        try:
+            self.progress.emit(f"Merging {len(self._files)} file(s)...")
+            pm = _merge_kml_files(self._files, self._out_path, self._label)
+            self.finished_ok.emit(self._out_path, pm, len(self._files))
+        except Exception as e:
+            log.exception("Selected KML merge failed")
+            self.failed.emit(str(e))
 
 
 # ─── KML Parser ────────────────────────────────────────────────────
@@ -307,6 +360,76 @@ def _parse_kml_points(kml_path: Path) -> list[dict]:
         log.warning("Failed to parse KML %s: %s", kml_path.name, e)
     return points
 
+
+_KML_NS = 'http://www.opengis.net/kml/2.2'
+
+
+def _year_from_transid(stem: str) -> str:
+    if len(stem) >= 8 and stem[:8].isdigit():
+        return stem[:4]
+    return 'unknown'
+
+
+def _scan_years(kml_dir: Path) -> dict[str, int]:
+    """Return {year: file_count} for KMLs present in kml_dir."""
+    counts: dict[str, int] = {}
+    if not kml_dir.exists():
+        return counts
+    for kml in kml_dir.glob('*.kml'):
+        y = _year_from_transid(kml.stem)
+        counts[y] = counts.get(y, 0) + 1
+    return counts
+
+
+def _merge_kml_files(files: list[Path], out_path: Path, doc_name: str) -> int:
+    """Merge Placemarks from the given KMLs into one KML at out_path.
+    Returns the number of Placemarks written."""
+    ET.register_namespace('', _KML_NS)
+    kml_root = ET.Element(f'{{{_KML_NS}}}kml')
+    doc = ET.SubElement(kml_root, f'{{{_KML_NS}}}Document')
+    name = ET.SubElement(doc, f'{{{_KML_NS}}}name')
+    name.text = doc_name
+
+    pm_count = 0
+    for src in files:
+        try:
+            src_root = ET.parse(src).getroot()
+            for pm in src_root.iter(f'{{{_KML_NS}}}Placemark'):
+                doc.append(pm)
+                pm_count += 1
+        except ET.ParseError:
+            log.warning("Skipping unparseable KML: %s", src)
+            continue
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(kml_root).write(out_path, encoding='utf-8',
+                                   xml_declaration=True)
+    return pm_count
+
+
+def _merge_kmls_by_year(kml_dir: Path, out_dir: Path,
+                        progress_cb=None,
+                        years: set[str] | None = None) -> dict[str, Path]:
+    if not kml_dir.exists():
+        return {}
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    buckets: dict[str, list[Path]] = {}
+    for kml in sorted(kml_dir.glob('*.kml')):
+        y = _year_from_transid(kml.stem)
+        if years is not None and y not in years:
+            continue
+        buckets.setdefault(y, []).append(kml)
+
+    written: dict[str, Path] = {}
+    for year, files in sorted(buckets.items()):
+        if progress_cb:
+            progress_cb(f"Merging {year}: {len(files)} file(s)...")
+        out_path = out_dir / f'{year}.kml'
+        _merge_kml_files(files, out_path, f'WiGLE {year}')
+        written[year] = out_path
+
+    return written
 
 
 # ─── Main View ──────────────────────────────────────────────────────
@@ -572,6 +695,9 @@ class WigleView(QWidget):
         self._dl_all_btn.clicked.connect(self._download_all)
         self._dl_all_btn.setEnabled(False)
         btn_row.addWidget(self._dl_all_btn)
+        self._dl_qgis_btn = _action_btn("QGIS Export", "#8e44ad", "white", bold=True)
+        self._dl_qgis_btn.clicked.connect(self._export_for_qgis)
+        btn_row.addWidget(self._dl_qgis_btn)
         self._dl_cancel_btn = _action_btn("Cancel", "#c0392b", "white", bold=True)
         self._dl_cancel_btn.clicked.connect(self._cancel_download)
         self._dl_cancel_btn.setVisible(False)
@@ -586,6 +712,8 @@ class WigleView(QWidget):
         dl_layout = QVBoxLayout(dl_group)
 
         self._dl_tree = _make_tx_tree()
+        self._dl_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._dl_tree.customContextMenuRequested.connect(self._on_dl_tree_menu)
         dl_layout.addWidget(self._dl_tree)
 
         self._dl_progress = QProgressBar()
@@ -1484,8 +1612,14 @@ class WigleView(QWidget):
             item = self._dl_tree.topLevelItem(i)
             if item.text(1) != "Downloaded":  # Status column
                 transids.append(item.data(0, Qt.ItemDataRole.UserRole))
+        self._start_download(transids)
+
+    def _start_download(self, transids: list[str]):
         if not transids:
             self._dl_status.setText("Nothing to download")
+            return
+        if hasattr(self, '_dl_worker') and self._dl_worker and self._dl_worker.isRunning():
+            self._dl_status.setText("A download is already in progress")
             return
         self._dl_all_btn.setEnabled(False)
         self._dl_all_btn.setText("Downloading...")
@@ -1500,17 +1634,114 @@ class WigleView(QWidget):
         self._workers.append(self._dl_worker)
         self._dl_worker.start()
 
-    def _on_kml_file_done(self, transid: str, success: bool):
+    def _on_dl_tree_menu(self, pos):
+        item_at = self._dl_tree.itemAt(pos)
+        selected = self._dl_tree.selectedItems()
+        if not item_at and not selected:
+            return
+        menu = QMenu(self._dl_tree)
+
+        # Scope: if right-click target is part of the selection, actions
+        # operate on the whole selection; otherwise just the single row.
+        if item_at and item_at in selected and len(selected) > 1:
+            scope_items = list(selected)
+        elif item_at:
+            scope_items = [item_at]
+        else:
+            scope_items = list(selected)
+
+        scope_transids = [it.data(0, Qt.ItemDataRole.UserRole) for it in scope_items]
+        dl_transids = [
+            it.data(0, Qt.ItemDataRole.UserRole)
+            for it in scope_items
+            if it.text(1) != "Downloaded"
+        ]
+        merge_transids = [
+            it.data(0, Qt.ItemDataRole.UserRole)
+            for it in scope_items
+            if (_KML_DIR / f"{it.data(0, Qt.ItemDataRole.UserRole)}.kml").exists()
+        ]
+        multi = len(scope_items) > 1
+
+        # Download action
+        if multi:
+            dl_label = f"Download Selected ({len(dl_transids)})"
+        else:
+            already = scope_items[0].text(1) == "Downloaded"
+            dl_label = "Re-download" if already else "Download"
+        act_dl = QAction(dl_label, menu)
+        act_dl.setEnabled(bool(dl_transids) or (not multi))
+        if multi:
+            act_dl.triggered.connect(lambda: self._start_download(dl_transids))
+        else:
+            act_dl.triggered.connect(lambda: self._start_download(scope_transids))
+        menu.addAction(act_dl)
+
+        # Merge to QGIS KML action
+        menu.addSeparator()
+        if multi:
+            merge_label = f"Merge to QGIS KML ({len(merge_transids)})"
+        else:
+            merge_label = "Merge to QGIS KML"
+        act_merge = QAction(merge_label, menu)
+        act_merge.setEnabled(bool(merge_transids))
+        act_merge.triggered.connect(lambda: self._merge_selected_to_qgis(merge_transids))
+        menu.addAction(act_merge)
+
+        menu.exec(self._dl_tree.viewport().mapToGlobal(pos))
+
+    def _merge_selected_to_qgis(self, transids: list[str]):
+        from datetime import datetime
+        files = [_KML_DIR / f"{t}.kml" for t in transids]
+        files = [f for f in files if f.exists()]
+        if not files:
+            QMessageBox.information(
+                self, "Merge to QGIS KML",
+                "None of the selected transactions have been downloaded yet.")
+            return
+        if hasattr(self, '_sel_merge_worker') and self._sel_merge_worker \
+                and self._sel_merge_worker.isRunning():
+            self._dl_status.setText("A merge is already in progress")
+            return
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        out_path = Path.home() / 'Downloads' / f'qgis-export-{stamp}.kml'
+        label = f'WiGLE selection ({len(files)} transactions, {stamp})'
+
+        self._dl_status.setText(f"Merging {len(files)} file(s)...")
+        self._sel_merge_worker = _KmlSelectedMergeWorker(files, out_path, label)
+        self._sel_merge_worker.progress.connect(self._dl_status.setText)
+        self._sel_merge_worker.finished_ok.connect(self._on_sel_merge_done)
+        self._sel_merge_worker.failed.connect(self._on_sel_merge_failed)
+        self._sel_merge_worker.start()
+
+    def _on_sel_merge_done(self, out_path: Path, placemarks: int, files_used: int):
+        self._dl_status.setText(
+            f"Merged {files_used} file(s), {placemarks:,} placemarks → "
+            f"~/Downloads/{out_path.name}"
+        )
+        log.info("Selected merge complete: %s (%d placemarks)", out_path, placemarks)
+
+    def _on_sel_merge_failed(self, msg: str):
+        self._dl_status.setText(f"Merge failed: {msg}")
+        QMessageBox.warning(self, "Merge failed", msg)
+
+    def _on_kml_file_done(self, transid: str, status: str):
         self._dl_progress.setValue(self._dl_progress.value() + 1)
         for i in range(self._dl_tree.topLevelItemCount()):
             item = self._dl_tree.topLevelItem(i)
             if item.data(0, Qt.ItemDataRole.UserRole) == transid:
-                if success:
+                if status == "ok":
                     item.setText(1, "Downloaded")
-                else:
+                elif status == "empty":
+                    # WiGLE reports the transaction has no KML content —
+                    # permanent, not worth retrying.
+                    item.setText(1, "Empty")
+                    item.setForeground(1, QColor('#f39c12'))
+                    _add_ignored_transid(transid)
+                else:  # "error"
+                    # Transient (HTTP 5xx, timeout, etc.) — leave retryable.
                     item.setText(1, "Failed")
                     item.setForeground(1, QColor('#e74c3c'))
-                    _add_ignored_transid(transid)
                 break
 
     def _cancel_download(self):
@@ -1539,3 +1770,96 @@ class WigleView(QWidget):
         self._dl_clear_ignored_btn.setText("Clear Ignore List")
         self._dl_clear_ignored_btn.setEnabled(False)
         self._dl_status.setText("Ignore list cleared")
+
+    def _export_for_qgis(self):
+        year_counts = _scan_years(_KML_DIR)
+        if not year_counts:
+            QMessageBox.information(
+                self, "QGIS Export",
+                "No KML files found. Use 'Find Transactions' and 'Download All' first.",
+            )
+            return
+        years = self._pick_export_years(year_counts)
+        if not years:
+            return
+        self._dl_qgis_btn.setEnabled(False)
+        self._dl_status.setText("Exporting for QGIS...")
+        self._qgis_worker = _KmlMergeWorker(years=years)
+        self._qgis_worker.progress.connect(self._dl_status.setText)
+        self._qgis_worker.finished_ok.connect(self._on_qgis_export_done)
+        self._qgis_worker.failed.connect(self._on_qgis_export_failed)
+        self._qgis_worker.start()
+
+    def _pick_export_years(self, year_counts: dict[str, int]) -> set[str] | None:
+        """Show a checkbox dialog for year selection.
+        Returns a set of selected years, or None if cancelled.
+        Defaults to current year preselected (or all if current year absent)."""
+        from datetime import date
+        current = str(date.today().year)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("QGIS Export — Select Years")
+        dlg.setMinimumWidth(340)
+        dlg.setStyleSheet("background-color: #1e1e1e; color: #e0e0e0;")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+
+        header = QLabel("Which years should be merged and written to ~/Downloads?")
+        header.setStyleSheet(_LABEL_STYLE)
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        checks: dict[str, QCheckBox] = {}
+        any_preselected = current in year_counts
+        for year in sorted(year_counts.keys()):
+            cb = QCheckBox(f"{year}  ({year_counts[year]} file{'s' if year_counts[year] != 1 else ''})")
+            cb.setStyleSheet(_LABEL_STYLE)
+            cb.setChecked(year == current if any_preselected else True)
+            layout.addWidget(cb)
+            checks[year] = cb
+
+        quick_row = QHBoxLayout()
+        btn_all = _action_btn("Select All", "#555", "white")
+        btn_all.clicked.connect(lambda: [cb.setChecked(True) for cb in checks.values()])
+        btn_none = _action_btn("Clear", "#555", "white")
+        btn_none.clicked.connect(lambda: [cb.setChecked(False) for cb in checks.values()])
+        quick_row.addWidget(btn_all)
+        quick_row.addWidget(btn_none)
+        quick_row.addStretch()
+        layout.addLayout(quick_row)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Export")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        def _update_ok():
+            bb.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+                any(cb.isChecked() for cb in checks.values()))
+        for cb in checks.values():
+            cb.toggled.connect(_update_ok)
+        _update_ok()
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return {y for y, cb in checks.items() if cb.isChecked()}
+
+    def _on_qgis_export_done(self, results: dict):
+        self._dl_qgis_btn.setEnabled(True)
+        if not results:
+            self._dl_status.setText("No KMLs to export.")
+            return
+        years = ", ".join(f"{y}.kml" for y in sorted(results.keys()))
+        self._dl_status.setText(
+            f"Exported {len(results)} file{'s' if len(results) != 1 else ''} to ~/Downloads: {years}"
+        )
+        log.info("QGIS export complete: %s", results)
+
+    def _on_qgis_export_failed(self, msg: str):
+        self._dl_qgis_btn.setEnabled(True)
+        self._dl_status.setText(f"Export failed: {msg}")
+        QMessageBox.warning(self, "QGIS Export failed", msg)

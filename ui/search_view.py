@@ -19,7 +19,7 @@ from database.wigle_api import WigleApiClient
 
 log = logging.getLogger(__name__)
 
-_KML_DIR = Path.home() / '.config' / 'airparse' / 'kml'
+_KML_DIR = Path.home() / 'AirParse' / 'Wigle'
 _STAGE_DIR = Path.home() / '.config' / 'airparse' / 'wigle_uploads'
 _PULL_DIR = Path.home() / '.local' / 'share' / 'airparse' / 'pulls'
 

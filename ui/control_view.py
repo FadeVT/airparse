@@ -1151,7 +1151,7 @@ class ControlView(QWidget):
             total_files += len(staged) + len(uploaded)
 
         # KML files
-        kml_dir = Path.home() / '.config' / 'airparse' / 'kml'
+        kml_dir = Path.home() / 'AirParse' / 'Wigle'
         if kml_dir.exists():
             kml_files = sorted(
                 [f for f in kml_dir.iterdir() if f.is_file() and f.suffix.lower() == '.kml'],
