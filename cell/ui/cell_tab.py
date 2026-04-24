@@ -26,7 +26,7 @@ try:
 except ImportError:
     HAS_WEBENGINE = False
 
-from cell import db, reader, enrich, wigle_api
+from cell import db, reader, enrich, wigle_api, bands as cbands
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +100,39 @@ class _EnrichWorker(QThread):
             self.failed.emit(str(e))
 
 
+class _EnrichAllWorker(QThread):
+    """Walks every tile containing unenriched cells. Cooperative cancel via
+    the _cancel flag — polled between tiles, so an in-flight API call still
+    completes before we tear down."""
+    progress = pyqtSignal(str, int, int)  # (msg, done, total)
+    finished_ok = pyqtSignal(object)      # BulkEnrichReport
+    failed = pyqtSignal(str)
+
+    def __init__(self, tile_size_deg: float = 1.0):
+        super().__init__()
+        self._tile_size = tile_size_deg
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            rep = enrich.enrich_all_unenriched(
+                tile_size_deg=self._tile_size,
+                progress_cb=lambda msg, done, total:
+                    self.progress.emit(msg, done, total),
+                is_cancelled=lambda: self._cancel,
+            )
+            if rep.error:
+                self.failed.emit(rep.error)
+            else:
+                self.finished_ok.emit(rep)
+        except Exception as e:
+            log.exception("Bulk cell enrich failed")
+            self.failed.emit(str(e))
+
+
 class CellTab(QWidget):
     """The whole Cell tab. Internally a QStackedWidget so future sub-pages
     (Search, Settings) can slot in cleanly without restructuring."""
@@ -166,6 +199,11 @@ class CellTab(QWidget):
         )
         self._enrich_btn.clicked.connect(self._trigger_enrich)
         stats_layout.addWidget(self._enrich_btn)
+
+        self._enrich_all_btn = _btn("Enrich All Unenriched", "#8e44ad", "white", bold=True)
+        self._enrich_all_btn.setMaximumHeight(28)
+        self._enrich_all_btn.clicked.connect(self._trigger_enrich_all)
+        stats_layout.addWidget(self._enrich_all_btn)
 
         layout.addWidget(stats_frame)
 
@@ -295,10 +333,18 @@ class CellTab(QWidget):
         group._checkboxes = {}
         return group
 
-    def _populate_checkboxes(self, group: QGroupBox, items: list[str]) -> None:
-        """Rebuild the checkbox list, preserving current check state."""
+    def _populate_checkboxes(
+        self,
+        group: QGroupBox,
+        items,
+        default_checked: bool = True,
+    ) -> None:
+        """Rebuild the checkbox list, preserving current check state.
+
+        `items` is either a list of strings (key == display text) or a list of
+        `(key, display_text, enabled)` tuples. Keys are what gets used for
+        filtering — display text is only what the user sees."""
         old_state = {k: cb.isChecked() for k, cb in group._checkboxes.items()}
-        # Clear existing (but keep trailing stretch)
         while group._content_layout.count() > 1:
             w = group._content_layout.takeAt(0).widget()
             if w is not None:
@@ -306,12 +352,18 @@ class CellTab(QWidget):
         group._checkboxes.clear()
 
         for item in items:
-            cb = QCheckBox(item)
-            cb.setStyleSheet(_LABEL_STYLE)
-            # Default: new items checked on first populate, preserve state otherwise.
-            cb.setChecked(old_state.get(item, True))
+            if isinstance(item, tuple):
+                key, display, enabled = item
+            else:
+                key, display, enabled = item, item, True
+            cb = QCheckBox(display)
+            cb.setStyleSheet(_LABEL_STYLE if enabled else _DIM_STYLE)
+            cb.setEnabled(enabled)
+            # Previously-set state wins; otherwise default_checked — but
+            # disabled entries always start unchecked regardless.
+            cb.setChecked(enabled and old_state.get(key, default_checked))
             cb.toggled.connect(group._on_change)
-            group._checkboxes[item] = cb
+            group._checkboxes[key] = cb
             group._content_layout.insertWidget(group._content_layout.count() - 1, cb)
 
     # ─── Lifecycle ───────────────────────────────────────────────────
@@ -326,14 +378,44 @@ class CellTab(QWidget):
         parts = []
         for radio, n in list(s["by_radio"].items())[:3]:
             parts.append(f"{radio} {n:,}")
+        unenriched = reader.unenriched_operator_count()
+        if unenriched:
+            parts.append(f"{unenriched:,} towers lack band info")
         self._stats_detail.setText("  •  ".join(parts) if parts else
                                    "No data yet — click Import.")
 
         self._populate_checkboxes(self._carrier_group, reader.distinct_carriers())
         self._populate_checkboxes(self._radio_group, reader.distinct_radio_types())
-        self._populate_checkboxes(self._band_group, reader.distinct_bands())
+        self._populate_band_filter()
+
+        # Enable the Enrich-All button only when there's unenriched data to chew on
+        if hasattr(self, "_enrich_all_btn"):
+            self._enrich_all_btn.setEnabled(unenriched > 0)
+            self._enrich_all_btn.setToolTip(
+                f"{unenriched:,} towers have no band info. Walks a grid of WiGLE "
+                f"/cell/search calls to fill them in. Respects rate-limit; can cancel."
+                if unenriched else
+                "All towers in this DB already have band info. Nothing to do."
+            )
 
         self._apply_filters()
+
+    def _populate_band_filter(self):
+        """Populate the band checkboxes with ALL standard US LTE + NR bands,
+        annotated with the number of resolved towers per band. Bands with no
+        data yet stay visible (dimmed) so the user sees the full vocabulary
+        and knows what enrichment could reveal."""
+        counts = reader.band_counts()
+        items = []
+        for label in cbands.all_band_labels():
+            n = counts.get(label, 0)
+            common = cbands.common_name_for(label) or ""
+            if n:
+                display = f"{label} — {common} ({n:,})" if common else f"{label} ({n:,})"
+            else:
+                display = f"{label} — {common}" if common else label
+            items.append((label, display, n > 0))
+        self._populate_checkboxes(self._band_group, items, default_checked=True)
 
     # ─── Filters → map ───────────────────────────────────────────────
 
@@ -480,6 +562,90 @@ class CellTab(QWidget):
         self._enrich_btn.setEnabled(True)
         self._enrich_btn.setText("Enrich Bands in This View")
         QMessageBox.warning(self, "Enrich failed", msg)
+
+    # ─── Bulk Enrich (all unenriched towers) ─────────────────────────
+
+    def _trigger_enrich_all(self):
+        # If an enrich-all is already running, clicking again cancels it.
+        if getattr(self, "_enrich_all_worker", None) and self._enrich_all_worker.isRunning():
+            self._enrich_all_worker.cancel()
+            self._enrich_all_btn.setText("Cancelling…")
+            self._enrich_all_btn.setEnabled(False)
+            return
+
+        if not wigle_api.has_credentials():
+            QMessageBox.information(
+                self, "WiGLE credentials needed",
+                "Set your WiGLE API Name + Token in Settings → WiGLE API first."
+            )
+            return
+
+        bbox = reader.unenriched_bbox()
+        unenriched = reader.unenriched_operator_count()
+        if bbox is None or unenriched == 0:
+            QMessageBox.information(
+                self, "Nothing to enrich",
+                "Every tower in your DB already has band info. Nothing to do."
+            )
+            return
+
+        # Confirm — this can be a long-running, API-heavy operation.
+        south, north, west, east = bbox
+        deg_w = max(abs(north - south), 0.5)
+        deg_h = max(abs(east - west), 0.5)
+        approx_tiles = max(1, int(deg_w * deg_h))  # rough
+        reply = QMessageBox.question(
+            self, "Enrich all unenriched towers?",
+            f"{unenriched:,} towers have no band info.\n"
+            f"Bounding region: {deg_w:.1f}° × {deg_h:.1f}° — "
+            f"~{approx_tiles:,} tile(s) at 1°×1°.\n\n"
+            "Each tile is one WiGLE /cell/search call (rate-limited to ~2s/call, "
+            "paginated to 1000/call). The run is incremental — you can cancel "
+            "mid-run and pick up where you left off next time.\n\n"
+            "Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._enrich_all_worker = _EnrichAllWorker(tile_size_deg=1.0)
+        self._enrich_all_worker.progress.connect(self._on_enrich_all_progress)
+        self._enrich_all_worker.finished_ok.connect(self._on_enrich_all_done)
+        self._enrich_all_worker.failed.connect(self._on_enrich_all_failed)
+        self._enrich_all_btn.setText("Cancel Bulk Enrich")
+        self._enrich_all_btn.setEnabled(True)
+        self._enrich_btn.setEnabled(False)
+        self._enrich_all_worker.start()
+
+    def _on_enrich_all_progress(self, msg: str, done: int, total: int):
+        self._stats_detail.setText(
+            f"{msg}  •  {done}/{total}" if total else msg
+        )
+
+    def _on_enrich_all_done(self, rep):
+        self._reset_enrich_all_ui()
+        suffix = "Cancelled partway." if rep.cancelled else "All tiles complete."
+        QMessageBox.information(
+            self, "Bulk enrich finished",
+            f"{suffix}\n\n"
+            f"Tiles: {rep.tiles_done}/{rep.tiles_total} "
+            f"(+{rep.tiles_skipped_empty} empty tiles skipped).\n"
+            f"Fetched {rep.cells_fetched:,} cell record(s) from WiGLE.\n"
+            f"Enriched {rep.rows_enriched:,} existing row(s).\n"
+            f"Inserted {rep.rows_inserted:,} new cell(s).\n"
+            f"{rep.rows_skipped_no_band:,} returned cells had no channel data."
+        )
+        self._refresh_filters_and_stats()
+
+    def _on_enrich_all_failed(self, msg: str):
+        self._reset_enrich_all_ui()
+        QMessageBox.warning(self, "Bulk enrich failed", msg)
+
+    def _reset_enrich_all_ui(self):
+        self._enrich_all_btn.setText("Enrich All Unenriched")
+        self._enrich_all_btn.setEnabled(True)
+        self._enrich_btn.setEnabled(True)
 
     # ─── Map HTML ────────────────────────────────────────────────────
 

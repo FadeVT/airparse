@@ -116,3 +116,22 @@ def resolve(radio_type: str, channel: int) -> Optional[Band]:
     if t in ("NR", "5G", "5GNR", "NR5G"):
         return nr_band_for_arfcn(channel)
     return None
+
+
+def all_band_labels() -> list[str]:
+    """Ordered list of every band label we know about — LTE first (ascending
+    by band number), then NR (ascending). Used to pre-populate the Cell tab's
+    Band filter so the UI shows the full coverage vocabulary even before any
+    API enrichment has run."""
+    return [b.label for b in LTE_BANDS] + [b.label for b in NR_BANDS]
+
+
+def common_name_for(label: str) -> Optional[str]:
+    """Look up marketing name for a given band label. None for unknowns."""
+    for b in LTE_BANDS:
+        if b.label == label:
+            return b.common_name
+    for b in NR_BANDS:
+        if b.label == label:
+            return b.common_name
+    return None

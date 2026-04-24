@@ -284,3 +284,46 @@ def distinct_bands() -> list[str]:
         digits = "".join(c for c in label if c.isdigit())
         return (tier, int(digits) if digits else 0)
     return sorted(rows, key=sort_key)
+
+
+def band_counts() -> dict[str, int]:
+    """Distinct-cell counts per resolved band_label. Used to annotate the Band
+    filter checkboxes with ("B66 — Extended AWS (1,247)") so the user can see
+    at a glance how much data they have per band without running a filter."""
+    with db.connect() as conn:
+        return {
+            r[0]: int(r[1])
+            for r in conn.execute(
+                "SELECT band_label, COUNT(DISTINCT operator_key) "
+                "FROM cells "
+                "WHERE band_label IS NOT NULL AND band_label != '' "
+                "GROUP BY band_label"
+            )
+        }
+
+
+def unenriched_bbox() -> tuple[float, float, float, float] | None:
+    """Bounding box of every cell whose band hasn't been resolved yet.
+    Returns (south, north, west, east) or None if there are no unenriched cells.
+    Drives the 'Enrich All Unenriched' flow — we walk this bbox in a grid."""
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT MIN(lat), MAX(lat), MIN(lon), MAX(lon), COUNT(*) "
+            "FROM cells "
+            "WHERE (band_number IS NULL) "
+            "  AND lat IS NOT NULL AND lon IS NOT NULL"
+        ).fetchone()
+    if not row or not row[4]:
+        return None
+    south, north, west, east = row[0], row[1], row[2], row[3]
+    if None in (south, north, west, east):
+        return None
+    return (float(south), float(north), float(west), float(east))
+
+
+def unenriched_operator_count() -> int:
+    """Unique towers (operator_keys) that don't yet have band info."""
+    with db.connect() as conn:
+        return int(conn.execute(
+            "SELECT COUNT(DISTINCT operator_key) FROM cells WHERE band_number IS NULL"
+        ).fetchone()[0])
