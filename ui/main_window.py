@@ -197,6 +197,9 @@ class MainWindow(QMainWindow):
         dl_item = QTreeWidgetItem(["Downloads"])
         self.nav_tree.addTopLevelItem(dl_item)
 
+        qgis_item = QTreeWidgetItem(["QGIS"])
+        self.nav_tree.addTopLevelItem(qgis_item)
+
     def _on_tab_changed(self, index: int):
         """Rebuild sidebar navigation when the active tab changes."""
         if index == 0:
@@ -1218,6 +1221,7 @@ class MainWindow(QMainWindow):
                 "Dashboard": WigleView.PAGE_DASHBOARD,
                 "Upload": WigleView.PAGE_UPLOAD,
                 "Downloads": WigleView.PAGE_DOWNLOADS,
+                "QGIS": WigleView.PAGE_QGIS,
             }
             page = page_map.get(item_text)
             if page is not None:

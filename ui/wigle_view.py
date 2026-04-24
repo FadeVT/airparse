@@ -12,7 +12,8 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem, QHeaderView, QFileDialog, QProgressBar,
     QLineEdit, QDateEdit, QCheckBox, QSizePolicy, QDialog,
     QTextEdit, QMessageBox, QTableWidget, QTableWidgetItem,
-    QAbstractItemView, QMenu, QDialogButtonBox
+    QAbstractItemView, QMenu, QDialogButtonBox, QRadioButton,
+    QButtonGroup, QPlainTextEdit,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QDate
 from PyQt6.QtGui import QFont, QColor, QAction
@@ -24,6 +25,7 @@ except ImportError:
     HAS_WEBENGINE = False
 
 from database.wigle_api import WigleApiClient
+from export import qgis_geopackage as qg
 
 log = logging.getLogger(__name__)
 
@@ -311,6 +313,33 @@ class _KmlMergeWorker(QThread):
             self.failed.emit(str(e))
 
 
+class _GpkgMergeWorker(QThread):
+    """Merges new WiGLE KMLs into the user's per-year GeoPackages via osgeo.ogr."""
+    progress = pyqtSignal(str)
+    finished_ok = pyqtSignal(list)  # list[qg.MergeResult]
+    failed = pyqtSignal(str)
+
+    def __init__(self, config: 'qg.QgisConfig', years: set[str] | None = None,
+                 force_reimport: bool = False):
+        super().__init__()
+        self._config = config
+        self._years = years
+        self._force = force_reimport
+
+    def run(self):
+        try:
+            results = qg.merge(
+                self._config, _KML_DIR,
+                years=self._years,
+                progress_cb=self.progress.emit,
+                force_reimport=self._force,
+            )
+            self.finished_ok.emit(results)
+        except Exception as e:
+            log.exception("GeoPackage merge failed")
+            self.failed.emit(str(e))
+
+
 class _KmlSelectedMergeWorker(QThread):
     """Merge a user-chosen subset of KMLs (by transid) into one file."""
     progress = pyqtSignal(str)
@@ -438,6 +467,7 @@ class WigleView(QWidget):
     PAGE_DASHBOARD = 0
     PAGE_UPLOAD = 1
     PAGE_DOWNLOADS = 2
+    PAGE_QGIS = 3
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -456,6 +486,7 @@ class WigleView(QWidget):
         self._stack.addWidget(self._build_dashboard_page())
         self._stack.addWidget(self._build_upload_page())
         self._stack.addWidget(self._build_downloads_page())
+        self._stack.addWidget(self._build_qgis_page())
         layout.addWidget(self._stack)
 
     def show_page(self, index: int):
@@ -695,9 +726,6 @@ class WigleView(QWidget):
         self._dl_all_btn.clicked.connect(self._download_all)
         self._dl_all_btn.setEnabled(False)
         btn_row.addWidget(self._dl_all_btn)
-        self._dl_qgis_btn = _action_btn("QGIS Export", "#8e44ad", "white", bold=True)
-        self._dl_qgis_btn.clicked.connect(self._export_for_qgis)
-        btn_row.addWidget(self._dl_qgis_btn)
         self._dl_cancel_btn = _action_btn("Cancel", "#c0392b", "white", bold=True)
         self._dl_cancel_btn.clicked.connect(self._cancel_download)
         self._dl_cancel_btn.setVisible(False)
@@ -731,6 +759,312 @@ class WigleView(QWidget):
 
         layout.addWidget(dl_group, 1)
         return page
+
+    # ─── QGIS Page ───────────────────────────────────────────────────
+
+    def _build_qgis_page(self) -> QWidget:
+        self._qgis_config = qg.QgisConfig.load()
+
+        page = QWidget()
+        page.setStyleSheet(_INPUT_STYLE)
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("QGIS Integration")
+        title.setFont(QFont('', 16, QFont.Weight.Bold))
+        title.setStyleSheet(_LABEL_STYLE)
+        layout.addWidget(title)
+
+        sub = QLabel(
+            "Merge new WiGLE KMLs into your per-year GeoPackages so QGIS picks "
+            "them up on next open without losing your existing styles."
+        )
+        sub.setStyleSheet(_DIM_STYLE)
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+
+        # ── Config card ──
+        cfg_group = QGroupBox("Paths")
+        cfg_group.setStyleSheet(_GROUP_STYLE)
+        cfg_layout = QVBoxLayout(cfg_group)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("GeoPackage folder:"))
+        self._qgis_folder_edit = QLineEdit(self._qgis_config.folder)
+        self._qgis_folder_edit.setPlaceholderText("~/QGIS/Wardriving")
+        self._qgis_folder_edit.editingFinished.connect(self._save_qgis_config)
+        folder_row.addWidget(self._qgis_folder_edit, 1)
+        browse_btn = _action_btn("Browse…")
+        browse_btn.clicked.connect(self._pick_qgis_folder)
+        folder_row.addWidget(browse_btn)
+        cfg_layout.addLayout(folder_row)
+
+        gpkg_row = QHBoxLayout()
+        gpkg_row.addWidget(QLabel("GPKG filename pattern:"))
+        self._qgis_gpkg_edit = QLineEdit(self._qgis_config.gpkg_pattern)
+        self._qgis_gpkg_edit.setPlaceholderText("{year} WIFI.gpkg")
+        self._qgis_gpkg_edit.editingFinished.connect(self._save_qgis_config)
+        gpkg_row.addWidget(self._qgis_gpkg_edit, 1)
+        cfg_layout.addLayout(gpkg_row)
+
+        layer_row = QHBoxLayout()
+        layer_row.addWidget(QLabel("Layer name pattern:"))
+        self._qgis_layer_edit = QLineEdit(self._qgis_config.layer_pattern)
+        self._qgis_layer_edit.setPlaceholderText("{year} WIFI")
+        self._qgis_layer_edit.editingFinished.connect(self._save_qgis_config)
+        layer_row.addWidget(self._qgis_layer_edit, 1)
+        cfg_layout.addLayout(layer_row)
+
+        tokens_hint = QLabel(
+            "Use <code>{year}</code> in either pattern — it's pulled from the "
+            "KML filename's YYYYMMDD prefix."
+        )
+        tokens_hint.setStyleSheet(_DIM_STYLE)
+        tokens_hint.setWordWrap(True)
+        cfg_layout.addWidget(tokens_hint)
+
+        self._qgis_create_missing = QCheckBox(
+            "Create the GeoPackage for a year if it doesn't exist yet "
+            "(will use the KML schema — style it once in QGIS)"
+        )
+        self._qgis_create_missing.setChecked(self._qgis_config.create_missing_year)
+        self._qgis_create_missing.toggled.connect(self._save_qgis_config)
+        cfg_layout.addWidget(self._qgis_create_missing)
+
+        self._qgis_force_reimport = QCheckBox(
+            "Force re-import of KMLs already recorded (disabled by default — "
+            "normal runs skip previously-imported transids)"
+        )
+        self._qgis_force_reimport.setChecked(False)
+        cfg_layout.addWidget(self._qgis_force_reimport)
+
+        layout.addWidget(cfg_group)
+
+        # ── Action row ──
+        act_row = QHBoxLayout()
+        self._qgis_detect_btn = _action_btn("Detect Layers", "#2980b9", "white")
+        self._qgis_detect_btn.setToolTip(
+            "Inspect the folder and list what GeoPackages and layers were found")
+        self._qgis_detect_btn.clicked.connect(self._qgis_detect)
+        act_row.addWidget(self._qgis_detect_btn)
+
+        self._qgis_validate_btn = _action_btn("Dry Run", "#2980b9", "white")
+        self._qgis_validate_btn.setToolTip(
+            "Preview what would be imported without writing anything")
+        self._qgis_validate_btn.clicked.connect(self._qgis_validate)
+        act_row.addWidget(self._qgis_validate_btn)
+
+        act_row.addStretch()
+
+        self._qgis_kml_btn = _action_btn(
+            "Per-year KML Export → ~/Downloads", "#8e44ad", "white")
+        self._qgis_kml_btn.setToolTip(
+            "Ad-hoc per-year KML export to ~/Downloads (the old behavior)")
+        self._qgis_kml_btn.clicked.connect(self._export_for_qgis)
+        act_row.addWidget(self._qgis_kml_btn)
+
+        self._qgis_export_btn = _action_btn(
+            "Export to QGIS", "#27ae60", "white", bold=True)
+        self._qgis_export_btn.setToolTip(
+            "Merge new KMLs into your per-year GeoPackages")
+        self._qgis_export_btn.clicked.connect(self._export_to_qgis_gpkg)
+        act_row.addWidget(self._qgis_export_btn)
+
+        layout.addLayout(act_row)
+
+        # ── Status + log ──
+        self._qgis_status = QLabel("")
+        self._qgis_status.setStyleSheet(_DIM_STYLE)
+        self._qgis_status.setWordWrap(True)
+        layout.addWidget(self._qgis_status)
+
+        self._qgis_log = QPlainTextEdit()
+        self._qgis_log.setReadOnly(True)
+        self._qgis_log.setStyleSheet(
+            "QPlainTextEdit { background-color: #2b2b2b; color: #e0e0e0; "
+            "border: 1px solid #444; border-radius: 4px; "
+            "font-family: monospace; font-size: 11px; }"
+        )
+        self._qgis_log.setPlaceholderText(
+            "Detect / Dry Run / Export results land here…")
+        layout.addWidget(self._qgis_log, 1)
+
+        if not qg._HAS_GDAL:
+            warn = QLabel(
+                "⚠ python-gdal is not installed. Install it with "
+                "<code>sudo pacman -S python-gdal</code> (or your distro's "
+                "equivalent) to enable GeoPackage merge. Per-year KML export "
+                "above still works without it."
+            )
+            warn.setStyleSheet(_YELLOW)
+            warn.setWordWrap(True)
+            layout.addWidget(warn)
+
+        return page
+
+    # ─── QGIS Page — handlers ────────────────────────────────────────
+
+    def _save_qgis_config(self):
+        self._qgis_config.folder = self._qgis_folder_edit.text().strip()
+        self._qgis_config.gpkg_pattern = self._qgis_gpkg_edit.text().strip() or '{year} WIFI.gpkg'
+        self._qgis_config.layer_pattern = self._qgis_layer_edit.text().strip() or '{year} WIFI'
+        self._qgis_config.create_missing_year = self._qgis_create_missing.isChecked()
+        self._qgis_config.save()
+
+    def _pick_qgis_folder(self):
+        start = self._qgis_folder_edit.text().strip() or str(Path.home())
+        picked = QFileDialog.getExistingDirectory(
+            self, "Pick the folder that holds your per-year WiGLE GeoPackages",
+            start,
+        )
+        if picked:
+            self._qgis_folder_edit.setText(picked)
+            self._save_qgis_config()
+
+    def _qgis_detect(self):
+        self._save_qgis_config()
+        if not qg._HAS_GDAL:
+            self._qgis_log.appendPlainText(
+                "python-gdal not available — can't inspect GeoPackages.")
+            return
+        if not self._qgis_config.folder:
+            self._qgis_log.appendPlainText(
+                "Set the GeoPackage folder first.")
+            return
+        try:
+            reports = qg.detect(self._qgis_config, _KML_DIR)
+        except Exception as e:
+            self._qgis_log.appendPlainText(f"Detect failed: {e}")
+            return
+        if not reports:
+            self._qgis_log.appendPlainText(
+                f"No KMLs in {_KML_DIR}. Download some from the Downloads page.")
+            return
+        self._qgis_log.appendPlainText("── Detect ────────────────────────────────")
+        for r in reports:
+            self._qgis_log.appendPlainText(
+                f"{r.year}: {len(r.kml_files)} KML(s), "
+                f"{len(r.new_transids)} new"
+            )
+            if r.gpkg_exists:
+                layer_msg = (
+                    f"  ✓ {r.gpkg_path.name} — layer "
+                    f"{'found' if r.layer_found else 'MISSING'}: "
+                    f"'{r.target_layer}'  "
+                    f"({r.feature_count:,} existing features, "
+                    f"{len(r.already_imported_transids)} transids on record)"
+                )
+                self._qgis_log.appendPlainText(layer_msg)
+                if not r.layer_found and r.layers_in_gpkg:
+                    self._qgis_log.appendPlainText(
+                        f"    layers in file: {', '.join(r.layers_in_gpkg)}")
+            else:
+                self._qgis_log.appendPlainText(
+                    f"  ✗ {r.gpkg_path.name} — missing"
+                    f"{' (would be created)' if self._qgis_config.create_missing_year else ''}")
+        self._qgis_status.setText(f"Detected {len(reports)} year(s).")
+
+    def _qgis_validate(self):
+        """Dry-run: enumerate what would be written, without writing anything."""
+        self._save_qgis_config()
+        if not qg._HAS_GDAL:
+            self._qgis_log.appendPlainText(
+                "python-gdal not available — can't dry-run.")
+            return
+        if not self._qgis_config.folder:
+            self._qgis_log.appendPlainText(
+                "Set the GeoPackage folder first.")
+            return
+        try:
+            reports = qg.detect(self._qgis_config, _KML_DIR)
+        except Exception as e:
+            self._qgis_log.appendPlainText(f"Dry-run failed: {e}")
+            return
+        self._qgis_log.appendPlainText("── Dry Run ──────────────────────────────")
+        any_work = False
+        for r in reports:
+            new_count = len(r.new_transids)
+            if not new_count:
+                self._qgis_log.appendPlainText(
+                    f"{r.year}: up to date ({len(r.kml_files)} KML(s) already on record)")
+                continue
+            any_work = True
+            if r.gpkg_exists and r.layer_found:
+                self._qgis_log.appendPlainText(
+                    f"{r.year}: would append {new_count} KML(s) to "
+                    f"{r.gpkg_path.name}:{r.target_layer}")
+            elif r.gpkg_exists and not r.layer_found:
+                self._qgis_log.appendPlainText(
+                    f"{r.year}: SKIP — '{r.target_layer}' not in {r.gpkg_path.name} "
+                    f"(layers: {', '.join(r.layers_in_gpkg)})")
+            elif self._qgis_config.create_missing_year:
+                self._qgis_log.appendPlainText(
+                    f"{r.year}: would CREATE {r.gpkg_path.name} and append {new_count} KML(s)")
+            else:
+                self._qgis_log.appendPlainText(
+                    f"{r.year}: SKIP — {r.gpkg_path.name} doesn't exist "
+                    f"(enable 'Create the GeoPackage…' to let AirParse make one)")
+        if not any_work:
+            self._qgis_status.setText("Nothing to import — everything is up to date.")
+        else:
+            self._qgis_status.setText("Dry run complete — see log.")
+
+    def _export_to_qgis_gpkg(self):
+        self._save_qgis_config()
+        if not qg._HAS_GDAL:
+            QMessageBox.warning(
+                self, "GDAL missing",
+                "python-gdal isn't installed. Install it and restart AirParse.")
+            return
+        if not self._qgis_config.folder:
+            QMessageBox.information(
+                self, "Export to QGIS",
+                "Set the GeoPackage folder first (top of this page).")
+            return
+        if hasattr(self, '_gpkg_worker') and self._gpkg_worker \
+                and self._gpkg_worker.isRunning():
+            self._qgis_status.setText("An export is already running.")
+            return
+
+        self._qgis_export_btn.setEnabled(False)
+        self._qgis_status.setText("Exporting to GeoPackage…")
+        self._qgis_log.appendPlainText("── Export ───────────────────────────────")
+        self._gpkg_worker = _GpkgMergeWorker(
+            self._qgis_config,
+            years=None,
+            force_reimport=self._qgis_force_reimport.isChecked(),
+        )
+        self._gpkg_worker.progress.connect(self._qgis_status.setText)
+        self._gpkg_worker.progress.connect(self._qgis_log.appendPlainText)
+        self._gpkg_worker.finished_ok.connect(self._on_gpkg_done)
+        self._gpkg_worker.failed.connect(self._on_gpkg_failed)
+        self._gpkg_worker.start()
+
+    def _on_gpkg_done(self, results: list):
+        self._qgis_export_btn.setEnabled(True)
+        total_added = sum(r.features_added for r in results)
+        total_files = sum(r.files_imported for r in results)
+        self._qgis_log.appendPlainText("── Summary ──────────────────────────────")
+        for r in results:
+            self._qgis_log.appendPlainText(
+                f"{r.year} [{r.action}]: {r.message or '-'}")
+        if total_added == 0:
+            self._qgis_status.setText(
+                "Export complete — everything was already up to date.")
+        else:
+            self._qgis_status.setText(
+                f"Export complete — added {total_added:,} feature(s) from "
+                f"{total_files} KML(s)."
+            )
+        log.info("GeoPackage export complete: %s",
+                 [(r.year, r.action, r.features_added) for r in results])
+
+    def _on_gpkg_failed(self, msg: str):
+        self._qgis_export_btn.setEnabled(True)
+        self._qgis_status.setText(f"Export failed: {msg}")
+        self._qgis_log.appendPlainText(f"Export failed: {msg}")
+        QMessageBox.warning(self, "Export to QGIS failed", msg)
 
     # ─── Lifecycle ───────────────────────────────────────────────────
 
@@ -1772,20 +2106,22 @@ class WigleView(QWidget):
         self._dl_status.setText("Ignore list cleared")
 
     def _export_for_qgis(self):
+        """Per-year KML merge to ~/Downloads — the original 'QGIS Export'
+        behavior, now secondary to the GeoPackage merge but kept for ad-hoc use."""
         year_counts = _scan_years(_KML_DIR)
         if not year_counts:
             QMessageBox.information(
-                self, "QGIS Export",
+                self, "Per-year KML Export",
                 "No KML files found. Use 'Find Transactions' and 'Download All' first.",
             )
             return
         years = self._pick_export_years(year_counts)
         if not years:
             return
-        self._dl_qgis_btn.setEnabled(False)
-        self._dl_status.setText("Exporting for QGIS...")
+        self._qgis_kml_btn.setEnabled(False)
+        self._qgis_status.setText("Exporting per-year KMLs to ~/Downloads…")
         self._qgis_worker = _KmlMergeWorker(years=years)
-        self._qgis_worker.progress.connect(self._dl_status.setText)
+        self._qgis_worker.progress.connect(self._qgis_status.setText)
         self._qgis_worker.finished_ok.connect(self._on_qgis_export_done)
         self._qgis_worker.failed.connect(self._on_qgis_export_failed)
         self._qgis_worker.start()
@@ -1849,17 +2185,21 @@ class WigleView(QWidget):
         return {y for y, cb in checks.items() if cb.isChecked()}
 
     def _on_qgis_export_done(self, results: dict):
-        self._dl_qgis_btn.setEnabled(True)
+        self._qgis_kml_btn.setEnabled(True)
         if not results:
-            self._dl_status.setText("No KMLs to export.")
+            self._qgis_status.setText("No KMLs to export.")
             return
         years = ", ".join(f"{y}.kml" for y in sorted(results.keys()))
-        self._dl_status.setText(
+        self._qgis_status.setText(
             f"Exported {len(results)} file{'s' if len(results) != 1 else ''} to ~/Downloads: {years}"
         )
-        log.info("QGIS export complete: %s", results)
+        self._qgis_log.appendPlainText(
+            f"Per-year KML export → {years}"
+        )
+        log.info("QGIS per-year KML export complete: %s", results)
 
     def _on_qgis_export_failed(self, msg: str):
-        self._dl_qgis_btn.setEnabled(True)
-        self._dl_status.setText(f"Export failed: {msg}")
-        QMessageBox.warning(self, "QGIS Export failed", msg)
+        self._qgis_kml_btn.setEnabled(True)
+        self._qgis_status.setText(f"Export failed: {msg}")
+        self._qgis_log.appendPlainText(f"Per-year KML export failed: {msg}")
+        QMessageBox.warning(self, "Per-year KML Export failed", msg)
