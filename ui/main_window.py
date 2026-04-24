@@ -34,6 +34,7 @@ from ui.pcap_views import HandshakeView, DeauthView, ProbeMapView, FrameTypeView
 from ui.connect_dialog import ConnectDialog
 from ui.control_view import ControlView
 from ui.wigle_view import WigleView
+from cell.ui.cell_tab import CellTab
 from ui.search_view import SearchView
 from ui.settings_dialog import SettingsDialog
 from export.export_dialog import show_export_dialog
@@ -197,8 +198,16 @@ class MainWindow(QMainWindow):
         dl_item = QTreeWidgetItem(["Downloads"])
         self.nav_tree.addTopLevelItem(dl_item)
 
+        db_item = QTreeWidgetItem(["Database"])
+        self.nav_tree.addTopLevelItem(db_item)
+
         qgis_item = QTreeWidgetItem(["QGIS"])
         self.nav_tree.addTopLevelItem(qgis_item)
+
+    def _build_cell_nav(self):
+        """Populate sidebar with Cell tab navigation items."""
+        self.nav_tree.clear()
+        self.nav_tree.addTopLevelItem(QTreeWidgetItem(["Map"]))
 
     def _on_tab_changed(self, index: int):
         """Rebuild sidebar navigation when the active tab changes."""
@@ -210,6 +219,8 @@ class MainWindow(QMainWindow):
             self._build_search_nav()
         elif index == 3:
             self._build_wigle_nav()
+        elif index == 4:
+            self._build_cell_nav()
 
     def _create_tab_widget(self) -> QTabWidget:
         """Create the main tabbed content area."""
@@ -271,8 +282,12 @@ class MainWindow(QMainWindow):
         self.wigle_view = WigleView()
         tab_widget.addTab(self.wigle_view, "WiGLE")
 
+        # Cell tab (completely separate from WiGLE — own DB, own pipeline)
+        self.cell_view = CellTab()
+        tab_widget.addTab(self.cell_view, "Cell")
+
         # Make built-in tabs non-closable
-        for i in range(4):
+        for i in range(5):
             tab_widget.tabBar().setTabButton(i, tab_widget.tabBar().ButtonPosition.RightSide, None)
 
         # Track current view name for tab title
@@ -1221,11 +1236,18 @@ class MainWindow(QMainWindow):
                 "Dashboard": WigleView.PAGE_DASHBOARD,
                 "Upload": WigleView.PAGE_UPLOAD,
                 "Downloads": WigleView.PAGE_DOWNLOADS,
+                "Database": WigleView.PAGE_DATABASE,
                 "QGIS": WigleView.PAGE_QGIS,
             }
             page = page_map.get(item_text)
             if page is not None:
                 self.wigle_view.show_page(page)
+            return
+
+        # Cell tab nav
+        if current_tab == 4:
+            if item_text == "Map":
+                self.cell_view.show_page(CellTab.PAGE_MAP)
             return
 
         # Control tab nav

@@ -132,6 +132,34 @@ def detect(config: QgisConfig, kml_dir: Path) -> list[YearReport]:
     return reports
 
 
+_FALLBACK_SKIP_PREFIXES = ('gpkg_', 'rtree_', 'sqlite_')
+_FALLBACK_SKIP_EXACT = {'layer_styles', STATE_TABLE}
+
+
+def _resolve_target_layer(ds, expected_name: str) -> tuple[Optional[str], object]:
+    """Find the right features table. Tries exact → case-insensitive →
+    first features-looking layer. Returns (actual_name, layer_handle)."""
+    layer = ds.GetLayerByName(expected_name)
+    if layer is not None:
+        return expected_name, layer
+
+    all_names = [ds.GetLayerByIndex(i).GetName() for i in range(ds.GetLayerCount())]
+    # Case-insensitive match
+    for name in all_names:
+        if name.lower() == expected_name.lower():
+            return name, ds.GetLayerByName(name)
+
+    # Fallback: first user-features layer (skip GPKG internals + our own state table)
+    for name in all_names:
+        if name in _FALLBACK_SKIP_EXACT:
+            continue
+        if any(name.startswith(p) for p in _FALLBACK_SKIP_PREFIXES):
+            continue
+        return name, ds.GetLayerByName(name)
+
+    return None, None
+
+
 def _inspect_gpkg(r: YearReport) -> None:
     """Populate layer list, feature count, schema, and imported-transids from the GPKG."""
     try:
@@ -143,9 +171,13 @@ def _inspect_gpkg(r: YearReport) -> None:
         return
     try:
         r.layers_in_gpkg = [ds.GetLayerByIndex(i).GetName() for i in range(ds.GetLayerCount())]
-        layer = ds.GetLayerByName(r.target_layer)
+        actual_name, layer = _resolve_target_layer(ds, r.target_layer)
         if layer is not None:
             r.layer_found = True
+            if actual_name and actual_name != r.target_layer:
+                # Rewrite the target to reflect what we'll actually use so
+                # downstream messaging and merge() both agree.
+                r.target_layer = actual_name
             r.feature_count = layer.GetFeatureCount()
             d = layer.GetLayerDefn()
             r.field_names = [d.GetFieldDefn(i).GetName() for i in range(d.GetFieldCount())]
@@ -213,15 +245,23 @@ def merge(
             continue
 
         try:
-            layer = ds.GetLayerByName(layer_name)
+            actual_name, layer = _resolve_target_layer(ds, layer_name)
             if layer is None:
                 result.action = 'skipped_no_layer'
                 available = ', '.join(ds.GetLayerByIndex(i).GetName()
                                       for i in range(ds.GetLayerCount()))
-                result.message = (f"Layer '{layer_name}' not in {gpkg_path.name}. "
+                result.message = (f"No usable layer in {gpkg_path.name}. "
                                   f"Layers found: {available}")
                 results.append(result)
                 continue
+            if actual_name != layer_name:
+                # Inform the user we auto-resolved to a different table name.
+                result.layer = actual_name
+                if progress_cb:
+                    progress_cb(
+                        f"{year}: using layer '{actual_name}' "
+                        f"(expected '{layer_name}', auto-detected)"
+                    )
 
             _ensure_state_table(ds)
             already = _read_imported_transids(ds)

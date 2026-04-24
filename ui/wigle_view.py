@@ -463,11 +463,96 @@ def _merge_kmls_by_year(kml_dir: Path, out_dir: Path,
 
 # ─── Main View ──────────────────────────────────────────────────────
 
+class _KmlScanWorker(QThread):
+    """Scans every KML in _KML_DIR, counting per-layer features, so the
+    Database page can show aggregate + per-file stats without blocking the UI.
+    """
+    progress = pyqtSignal(int, int)              # (done, total)
+    file_done = pyqtSignal(str, dict)            # (transid, row_dict)
+    finished_all = pyqtSignal(dict)              # aggregate summary
+
+    def run(self):
+        try:
+            from osgeo import ogr as _ogr
+            _ogr.UseExceptions()
+        except ImportError:
+            self.finished_all.emit({"error": "python-gdal not installed"})
+            return
+        kmls = sorted(_KML_DIR.glob('*.kml')) if _KML_DIR.exists() else []
+        agg = {
+            "files": 0, "size_bytes": 0,
+            "wifi": 0, "cell": 0, "bt": 0,
+            "earliest": None, "latest": None,
+        }
+        for idx, kml in enumerate(kmls, 1):
+            try:
+                row = _scan_kml(_ogr, kml)
+            except Exception as e:
+                row = {"error": str(e), "wifi": 0, "cell": 0, "bt": 0}
+            row["transid"] = kml.stem
+            row["path"] = str(kml)
+            row["size"] = kml.stat().st_size if kml.exists() else 0
+            agg["files"] += 1
+            agg["size_bytes"] += row["size"]
+            agg["wifi"] += row.get("wifi", 0)
+            agg["cell"] += row.get("cell", 0)
+            agg["bt"] += row.get("bt", 0)
+            # transid starts YYYYMMDD — cheap min/max
+            date = kml.stem[:8]
+            if len(date) == 8 and date.isdigit():
+                if agg["earliest"] is None or date < agg["earliest"]:
+                    agg["earliest"] = date
+                if agg["latest"] is None or date > agg["latest"]:
+                    agg["latest"] = date
+            self.file_done.emit(kml.stem, row)
+            self.progress.emit(idx, len(kmls))
+        self.finished_all.emit(agg)
+
+
+def _scan_kml(ogr_mod, kml_path: Path) -> dict:
+    """Count features per layer. Uses GDAL so it matches what the QGIS export
+    and cell reader actually see."""
+    row = {"wifi": 0, "cell": 0, "bt": 0}
+    ds = ogr_mod.Open(str(kml_path))
+    if ds is None:
+        return row
+    try:
+        for i in range(ds.GetLayerCount()):
+            lyr = ds.GetLayerByIndex(i)
+            name = lyr.GetName()
+            count = lyr.GetFeatureCount()
+            if name == "Wifi Networks":
+                row["wifi"] = count
+            elif name == "Cellular Networks":
+                row["cell"] = count
+            elif name == "Bluetooth Networks":
+                row["bt"] = count
+    finally:
+        ds = None
+    return row
+
+
+def _fmt_date(d: str) -> str:
+    """YYYYMMDD → YYYY-MM-DD."""
+    if len(d) == 8 and d.isdigit():
+        return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    return d
+
+
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
 class WigleView(QWidget):
     PAGE_DASHBOARD = 0
     PAGE_UPLOAD = 1
     PAGE_DOWNLOADS = 2
-    PAGE_QGIS = 3
+    PAGE_DATABASE = 3
+    PAGE_QGIS = 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -486,11 +571,14 @@ class WigleView(QWidget):
         self._stack.addWidget(self._build_dashboard_page())
         self._stack.addWidget(self._build_upload_page())
         self._stack.addWidget(self._build_downloads_page())
+        self._stack.addWidget(self._build_database_page())
         self._stack.addWidget(self._build_qgis_page())
         layout.addWidget(self._stack)
 
     def show_page(self, index: int):
         self._stack.setCurrentIndex(index)
+        if index == self.PAGE_DATABASE:
+            self._ensure_db_scanned()
 
     # ─── Dashboard Page ─────────────────────────────────────────────
 
@@ -759,6 +847,281 @@ class WigleView(QWidget):
 
         layout.addWidget(dl_group, 1)
         return page
+
+    # ─── Database Page ───────────────────────────────────────────────
+
+    def _build_database_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet(_INPUT_STYLE)
+        layout = QVBoxLayout(page)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("KML Database")
+        title.setFont(QFont('', 16, QFont.Weight.Bold))
+        title.setStyleSheet(_LABEL_STYLE)
+        layout.addWidget(title)
+
+        # Aggregate banner
+        banner = QFrame()
+        banner.setStyleSheet("QFrame { background-color: #2a2a2a; border: 1px solid #444; border-radius: 6px; }")
+        b = QHBoxLayout(banner)
+        b.setContentsMargins(14, 10, 14, 10)
+        b.setSpacing(22)
+
+        def stat_col(label_text, color_style=_GREEN):
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            v = QLabel("--")
+            v.setFont(QFont('', 14, QFont.Weight.Bold))
+            v.setStyleSheet(color_style)
+            k = QLabel(label_text)
+            k.setStyleSheet(_DIM_STYLE)
+            col.addWidget(v)
+            col.addWidget(k)
+            return col, v
+
+        files_col, self._db_files = stat_col("Files", _LABEL_STYLE)
+        size_col, self._db_size = stat_col("On disk", _LABEL_STYLE)
+        wifi_col, self._db_wifi = stat_col("WiFi observations", _GREEN)
+        cell_col, self._db_cell = stat_col("Cell observations", _YELLOW)
+        bt_col, self._db_bt = stat_col("Bluetooth observations", "color: #58A6FF; border: none; background: transparent;")
+        date_col, self._db_dates = stat_col("Date range", _DIM_STYLE)
+
+        for c in (files_col, size_col, wifi_col, cell_col, bt_col, date_col):
+            b.addLayout(c)
+        b.addStretch(1)
+
+        self._db_refresh_btn = _action_btn("Refresh", "#2980b9", "white", bold=True)
+        self._db_refresh_btn.clicked.connect(self._rescan_kmls)
+        b.addWidget(self._db_refresh_btn)
+
+        layout.addWidget(banner)
+
+        # Progress + status
+        self._db_progress = QProgressBar()
+        self._db_progress.setVisible(False)
+        self._db_progress.setStyleSheet("""
+            QProgressBar { background-color: #333; border: 1px solid #555;
+                           border-radius: 4px; text-align: center; color: #e0e0e0; }
+            QProgressBar::chunk { background-color: #2980b9; border-radius: 3px; }
+        """)
+        layout.addWidget(self._db_progress)
+
+        self._db_status = QLabel("")
+        self._db_status.setStyleSheet(_DIM_STYLE)
+        layout.addWidget(self._db_status)
+
+        # File table
+        self._db_tree = QTreeWidget()
+        self._db_tree.setStyleSheet(_TREE_STYLE)
+        self._db_tree.setAlternatingRowColors(True)
+        self._db_tree.setHeaderLabels([
+            "Transid", "Date", "Size", "WiFi", "Cell", "BT",
+        ])
+        self._db_tree.setSortingEnabled(True)
+        self._db_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._db_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._db_tree.customContextMenuRequested.connect(self._on_db_tree_menu)
+        hdr = self._db_tree.header()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self._db_tree.setColumnWidth(0, 260)
+        layout.addWidget(self._db_tree, 1)
+
+        self._db_scanned = False
+        return page
+
+    def _ensure_db_scanned(self):
+        """Kick off a scan on first entry to the Database page."""
+        if self._db_scanned:
+            return
+        self._rescan_kmls()
+
+    def _rescan_kmls(self):
+        if hasattr(self, '_db_scan_worker') and self._db_scan_worker and self._db_scan_worker.isRunning():
+            return
+        self._db_scanned = True
+        self._db_tree.setSortingEnabled(False)
+        self._db_tree.clear()
+        self._db_progress.setVisible(True)
+        self._db_progress.setValue(0)
+        self._db_status.setText("Scanning KML files…")
+
+        self._db_scan_worker = _KmlScanWorker()
+        self._db_scan_worker.progress.connect(self._on_db_scan_progress)
+        self._db_scan_worker.file_done.connect(self._on_db_file_done)
+        self._db_scan_worker.finished_all.connect(self._on_db_scan_done)
+        self._db_scan_worker.start()
+
+    def _on_db_scan_progress(self, done: int, total: int):
+        self._db_progress.setMaximum(total)
+        self._db_progress.setValue(done)
+        self._db_status.setText(f"Scanning KMLs… {done:,} / {total:,}")
+
+    def _on_db_file_done(self, transid: str, row: dict):
+        item = QTreeWidgetItem([
+            transid,
+            _fmt_date(transid[:8]),
+            _fmt_size(row.get("size", 0)),
+            f"{row.get('wifi', 0):,}",
+            f"{row.get('cell', 0):,}",
+            f"{row.get('bt', 0):,}",
+        ])
+        item.setData(0, Qt.ItemDataRole.UserRole, row.get("path", ""))
+        # Right-justify numeric columns.
+        for col in (2, 3, 4, 5):
+            item.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if row.get("error"):
+            item.setForeground(0, QColor('#e74c3c'))
+            item.setToolTip(0, row["error"])
+        self._db_tree.addTopLevelItem(item)
+
+    def _on_db_scan_done(self, agg: dict):
+        self._db_progress.setVisible(False)
+        if agg.get("error"):
+            self._db_status.setText(f"Scan failed: {agg['error']}")
+            return
+        self._db_tree.setSortingEnabled(True)
+        self._db_tree.sortItems(0, Qt.SortOrder.DescendingOrder)
+
+        self._db_files.setText(f"{agg.get('files', 0):,}")
+        self._db_size.setText(_fmt_size(agg.get('size_bytes', 0)))
+        self._db_wifi.setText(f"{agg.get('wifi', 0):,}")
+        self._db_cell.setText(f"{agg.get('cell', 0):,}")
+        self._db_bt.setText(f"{agg.get('bt', 0):,}")
+
+        earliest = agg.get("earliest")
+        latest = agg.get("latest")
+        if earliest and latest:
+            self._db_dates.setText(f"{_fmt_date(earliest)} → {_fmt_date(latest)}")
+        else:
+            self._db_dates.setText("—")
+
+        self._db_status.setText(
+            f"Scanned {agg.get('files', 0):,} KML file(s) in {_KML_DIR}"
+        )
+
+    def _on_db_tree_menu(self, pos):
+        selected = self._db_tree.selectedItems()
+        clicked = self._db_tree.itemAt(pos)
+        if clicked and clicked not in selected:
+            scope = [clicked]
+        else:
+            scope = selected or ([clicked] if clicked else [])
+        if not scope:
+            return
+
+        menu = QMenu(self)
+        multi = len(scope) > 1
+
+        if not multi:
+            act_open = QAction("Open containing folder", menu)
+            act_open.triggered.connect(lambda: self._open_containing_folder(scope[0]))
+            menu.addAction(act_open)
+
+        act_qgis = QAction(
+            f"Re-import to QGIS ({len(scope)})" if multi else "Re-import to QGIS",
+            menu,
+        )
+        act_qgis.setToolTip(
+            "Jump to the QGIS page with 'force re-import' enabled for the selected transids"
+        )
+        act_qgis.triggered.connect(lambda: self._reimport_to_qgis(scope))
+        menu.addAction(act_qgis)
+
+        act_cell = QAction(
+            f"Re-import cells ({len(scope)})" if multi else "Re-import cells",
+            menu,
+        )
+        act_cell.setToolTip(
+            "Force-reimport the selected transids into the Cell subsystem"
+        )
+        act_cell.triggered.connect(lambda: self._reimport_to_cells(scope))
+        menu.addAction(act_cell)
+
+        menu.addSeparator()
+        act_delete = QAction(
+            f"Delete file(s) ({len(scope)})" if multi else "Delete file",
+            menu,
+        )
+        act_delete.triggered.connect(lambda: self._delete_selected_kmls(scope))
+        menu.addAction(act_delete)
+
+        menu.exec(self._db_tree.viewport().mapToGlobal(pos))
+
+    def _open_containing_folder(self, item):
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
+
+    def _delete_selected_kmls(self, scope):
+        if not scope:
+            return
+        msg = (f"Permanently delete {len(scope)} KML file(s) from "
+               f"{_KML_DIR}?\n\nThey can be re-downloaded from WiGLE later.")
+        resp = QMessageBox.question(
+            self, "Delete KML files", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        removed = 0
+        for item in scope:
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path and Path(path).exists():
+                try:
+                    Path(path).unlink()
+                    removed += 1
+                except OSError as e:
+                    log.warning("Couldn't delete %s: %s", path, e)
+        self._db_status.setText(f"Deleted {removed} file(s)")
+        self._rescan_kmls()
+
+    def _reimport_to_qgis(self, scope):
+        # Stash the selection somewhere persistent enough that the QGIS page
+        # could pick it up — for v1 we just hand the transids to the Cell
+        # subsystem's known API path and rely on the user clicking Export.
+        transids = [item.text(0) for item in scope]
+        QMessageBox.information(
+            self, "Re-import to QGIS",
+            f"Selected {len(transids)} transid(s). Head to the QGIS page and "
+            f"check 'Force re-import of KMLs already recorded' before clicking "
+            f"Export to QGIS — those files will be processed again."
+        )
+
+    def _reimport_to_cells(self, scope):
+        # Direct cell-side re-import of just these transids.
+        try:
+            from cell import reader as cell_reader, db as cell_db
+        except Exception as e:
+            QMessageBox.warning(self, "Cell subsystem unavailable", str(e))
+            return
+        transids = [item.text(0) for item in scope]
+        with cell_db.connect() as conn:
+            placeholders = ",".join("?" for _ in transids)
+            conn.execute(
+                f"DELETE FROM imported_transids WHERE transid IN ({placeholders})",
+                transids,
+            )
+            conn.execute(
+                f"DELETE FROM cells WHERE source_transid IN ({placeholders})",
+                transids,
+            )
+            conn.commit()
+        rep = cell_reader.import_all(progress_cb=lambda s: None)
+        QMessageBox.information(
+            self, "Cell re-import complete",
+            f"Forced re-ingest of {len(transids)} transid(s).\n"
+            f"Net result: {rep.cells_inserted:,} cell observations re-added."
+        )
 
     # ─── QGIS Page ───────────────────────────────────────────────────
 
