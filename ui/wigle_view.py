@@ -242,14 +242,58 @@ class _UploadWorker(QThread):
 
 
 class _KmlParseWorker(QThread):
-    """Parse all local KML files off the main thread."""
+    """Legacy WiFi parser — deprecated.
+
+    Replaced by `_WifiLoadWorker`, which queries `wifi/db` (populated by the
+    new `wifi` subsystem's state-tracked incremental KML importer). Kept so
+    any stale references don't blow up during the transition; safe to delete
+    once nothing references it.
+    """
     result = pyqtSignal(list)
     def run(self):
-        points = []
+        self.result.emit([])
+
+
+class _WifiLoadWorker(QThread):
+    """Incrementally import any new WiGLE KMLs into `wifi_points.db`, then
+    return one dedup'd point per unique BSSID for the dashboard map.
+    Everything past the first run is near-instant — only new transids get
+    re-parsed, then the aggregate query runs straight out of SQLite."""
+    result = pyqtSignal(dict)
+
+    def run(self):
+        try:
+            from wifi import reader as wreader, db as wdb
+        except ImportError as e:
+            self.result.emit({"points": [], "hint": f"WiFi module error: {e}"})
+            return
+
+        already = wdb.imported_transids()
+        live_transids = set()
         if _KML_DIR.exists():
-            for kml_file in _KML_DIR.glob('*.kml'):
-                points.extend(_parse_kml_points(kml_file))
-        self.result.emit(points)
+            live_transids = {p.stem for p in _KML_DIR.glob("*.kml")}
+        new_transids = live_transids - already
+
+        if new_transids:
+            try:
+                wreader.import_all(progress_cb=lambda _s: None)
+            except Exception as e:
+                log.exception("WiFi incremental import failed")
+                # Continue to query whatever's already in the DB.
+
+        try:
+            networks = wdb.query_networks(limit=2_000_000)
+        except Exception as e:
+            log.exception("WiFi DB query failed")
+            self.result.emit({"points": [], "hint": f"WiFi DB error: {e}"})
+            return
+
+        points = [
+            {"lat": n["lat"], "lon": n["lon"], "name": n.get("ssid") or ""}
+            for n in networks
+            if n.get("lat") is not None and n.get("lon") is not None
+        ]
+        self.result.emit({"points": points})
 
 
 class _KmlBatchWorker(QThread):
@@ -464,72 +508,47 @@ def _merge_kmls_by_year(kml_dir: Path, out_dir: Path,
 # ─── Main View ──────────────────────────────────────────────────────
 
 class _KmlScanWorker(QThread):
-    """Scans every KML in _KML_DIR, counting per-layer features, so the
-    Database page can show aggregate + per-file stats without blocking the UI.
+    """Incremental KML scan backed by the persistent manifest — only re-opens
+    files whose size/mtime changed since the last run, so the Database page
+    loads instantly after the first full scan.
     """
     progress = pyqtSignal(int, int)              # (done, total)
     file_done = pyqtSignal(str, dict)            # (transid, row_dict)
     finished_all = pyqtSignal(dict)              # aggregate summary
 
+    def __init__(self, force: bool = False):
+        super().__init__()
+        self._force = force
+
     def run(self):
         try:
-            from osgeo import ogr as _ogr
-            _ogr.UseExceptions()
-        except ImportError:
-            self.finished_all.emit({"error": "python-gdal not installed"})
+            from database import kml_manifest
+        except ImportError as e:
+            self.finished_all.emit({"error": str(e)})
             return
-        kmls = sorted(_KML_DIR.glob('*.kml')) if _KML_DIR.exists() else []
-        agg = {
-            "files": 0, "size_bytes": 0,
-            "wifi": 0, "cell": 0, "bt": 0,
-            "earliest": None, "latest": None,
-        }
-        for idx, kml in enumerate(kmls, 1):
-            try:
-                row = _scan_kml(_ogr, kml)
-            except Exception as e:
-                row = {"error": str(e), "wifi": 0, "cell": 0, "bt": 0}
-            row["transid"] = kml.stem
-            row["path"] = str(kml)
-            row["size"] = kml.stat().st_size if kml.exists() else 0
-            agg["files"] += 1
-            agg["size_bytes"] += row["size"]
-            agg["wifi"] += row.get("wifi", 0)
-            agg["cell"] += row.get("cell", 0)
-            agg["bt"] += row.get("bt", 0)
-            # transid starts YYYYMMDD — cheap min/max
-            date = kml.stem[:8]
-            if len(date) == 8 and date.isdigit():
-                if agg["earliest"] is None or date < agg["earliest"]:
-                    agg["earliest"] = date
-                if agg["latest"] is None or date > agg["latest"]:
-                    agg["latest"] = date
-            self.file_done.emit(kml.stem, row)
-            self.progress.emit(idx, len(kmls))
-        self.finished_all.emit(agg)
 
+        def _file_cb(transid, entry):
+            self.file_done.emit(transid, {
+                "transid": transid,
+                "path": str(_KML_DIR / f"{transid}.kml"),
+                "size": entry.size,
+                "wifi": entry.wifi,
+                "cell": entry.cell,
+                "bt": entry.bt,
+                "error": entry.error,
+            })
 
-def _scan_kml(ogr_mod, kml_path: Path) -> dict:
-    """Count features per layer. Uses GDAL so it matches what the QGIS export
-    and cell reader actually see."""
-    row = {"wifi": 0, "cell": 0, "bt": 0}
-    ds = ogr_mod.Open(str(kml_path))
-    if ds is None:
-        return row
-    try:
-        for i in range(ds.GetLayerCount()):
-            lyr = ds.GetLayerByIndex(i)
-            name = lyr.GetName()
-            count = lyr.GetFeatureCount()
-            if name == "Wifi Networks":
-                row["wifi"] = count
-            elif name == "Cellular Networks":
-                row["cell"] = count
-            elif name == "Bluetooth Networks":
-                row["bt"] = count
-    finally:
-        ds = None
-    return row
+        try:
+            _, agg = kml_manifest.scan(
+                _KML_DIR,
+                progress_cb=lambda d, t: self.progress.emit(d, t),
+                file_cb=_file_cb,
+                force=self._force,
+            )
+            self.finished_all.emit(agg)
+        except Exception as e:
+            log.exception("KML manifest scan failed")
+            self.finished_all.emit({"error": str(e)})
 
 
 def _fmt_date(d: str) -> str:
@@ -1044,6 +1063,16 @@ class WigleView(QWidget):
         act_cell.triggered.connect(lambda: self._reimport_to_cells(scope))
         menu.addAction(act_cell)
 
+        act_wifi = QAction(
+            f"Re-import WiFi ({len(scope)})" if multi else "Re-import WiFi",
+            menu,
+        )
+        act_wifi.setToolTip(
+            "Force-reimport the selected transids into the WiFi subsystem"
+        )
+        act_wifi.triggered.connect(lambda: self._reimport_to_wifi(scope))
+        menu.addAction(act_wifi)
+
         menu.addSeparator()
         act_delete = QAction(
             f"Delete file(s) ({len(scope)})" if multi else "Delete file",
@@ -1121,6 +1150,31 @@ class WigleView(QWidget):
             self, "Cell re-import complete",
             f"Forced re-ingest of {len(transids)} transid(s).\n"
             f"Net result: {rep.cells_inserted:,} cell observations re-added."
+        )
+
+    def _reimport_to_wifi(self, scope):
+        try:
+            from wifi import reader as wifi_reader, db as wifi_db
+        except Exception as e:
+            QMessageBox.warning(self, "WiFi subsystem unavailable", str(e))
+            return
+        transids = [item.text(0) for item in scope]
+        with wifi_db.connect() as conn:
+            placeholders = ",".join("?" for _ in transids)
+            conn.execute(
+                f"DELETE FROM wifi_imported_transids WHERE transid IN ({placeholders})",
+                transids,
+            )
+            conn.execute(
+                f"DELETE FROM wifi_observations WHERE source_transid IN ({placeholders})",
+                transids,
+            )
+            conn.commit()
+        rep = wifi_reader.import_all(progress_cb=lambda s: None)
+        QMessageBox.information(
+            self, "WiFi re-import complete",
+            f"Forced re-ingest of {len(transids)} transid(s).\n"
+            f"Net result: {rep.observations_inserted:,} WiFi observations re-added."
         )
 
     # ─── QGIS Page ───────────────────────────────────────────────────
@@ -1470,27 +1524,40 @@ class WigleView(QWidget):
             self._load_kml_to_map()
 
     def _load_kml_to_map(self):
-        if not _KML_DIR.exists():
-            return
+        """Load WiFi networks from wifi_points.db into the dashboard map.
+        Incremental import: if there are new KMLs that haven't been ingested
+        yet, they get added first, then the map re-queries the DB."""
         self._reload_map_btn.setEnabled(False)
-        self._reload_map_btn.setText("Loading KML...")
-        worker = _KmlParseWorker()
-        worker.result.connect(self._on_kml_parsed)
+        self._reload_map_btn.setText("Loading WiFi…")
+        worker = _WifiLoadWorker()
+        worker.result.connect(self._on_wifi_loaded)
         worker.result.connect(lambda _: self._workers.remove(worker))
         self._workers.append(worker)
         worker.start()
 
-    def _on_kml_parsed(self, all_points: list):
+    def _on_wifi_loaded(self, payload: dict):
         self._reload_map_btn.setEnabled(True)
-        if all_points:
+        points = payload.get("points") or []
+        count = len(points)
+        if count:
             if self._map_ready:
-                self._send_points_to_map(all_points)
+                self._send_points_to_map(points)
             else:
-                self._pending_points = all_points
-            self._reload_map_btn.setText(f"Reload KML Data ({len(all_points):,} points)")
+                self._pending_points = points
+            self._reload_map_btn.setText(
+                f"Reload WiFi Networks ({count:,} networks)"
+            )
         else:
-            self._reload_map_btn.setText("No KML files found")
-            QTimer.singleShot(3000, lambda: self._reload_map_btn.setText("Reload KML Data"))
+            msg = payload.get("hint") or "No WiFi networks yet"
+            self._reload_map_btn.setText(msg)
+            QTimer.singleShot(
+                4000, lambda: self._reload_map_btn.setText("Reload WiFi Networks")
+            )
+
+    # Back-compat alias — the original parser callback name is referenced
+    # elsewhere in the file (showEvent path). Route it to the new handler.
+    def _on_kml_parsed(self, all_points: list):
+        self._on_wifi_loaded({"points": all_points})
 
     def _send_points_to_map(self, points: list[dict]):
         if not self._map_view:
