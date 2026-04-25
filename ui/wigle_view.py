@@ -1560,14 +1560,21 @@ class WigleView(QWidget):
         self._on_wifi_loaded({"points": all_points})
 
     def _send_points_to_map(self, points: list[dict]):
+        """Stream points to the page in 25k-row chunks. Sending the full set
+        in a single `runJavaScript` call silently drops past ~10 MB on
+        QtWebEngine, which made the 1M-network case render an empty map."""
         if not self._map_view:
             return
-        data = json.dumps(points)
-        self._map_view.page().runJavaScript(f"setPoints({data});")
+        page = self._map_view.page()
+        page.runJavaScript("clearPoints();")
+        chunk = 25_000
+        for i in range(0, len(points), chunk):
+            page.runJavaScript(f"appendPoints({json.dumps(points[i:i + chunk])});")
+        page.runJavaScript("finalizePoints();")
         if points:
             lats = [p['lat'] for p in points]
             lons = [p['lon'] for p in points]
-            self._map_view.page().runJavaScript(
+            page.runJavaScript(
                 f"fitBounds({min(lats)}, {min(lons)}, {max(lats)}, {max(lons)});")
 
     def _generate_map_html(self) -> str:
@@ -1656,8 +1663,29 @@ class WigleView(QWidget):
     });
 
     function setPoints(points) {
-        pointData = points;
-        buildGrid(points);
+        // Single-shot variant kept for back-compat with smaller payloads
+        // (cell tab + viewport-scoped queries). The dashboard now streams
+        // via clearPoints/appendPoints/finalizePoints to dodge the
+        // runJavaScript size limit when rendering all WiFi networks.
+        clearPoints();
+        appendPoints(points);
+        finalizePoints();
+    }
+    function clearPoints() {
+        pointData = [];
+        spatialGrid = {};
+        if (dotLayer) { map.removeLayer(dotLayer); dotLayer = null; }
+    }
+    function appendPoints(points) {
+        for (var i = 0; i < points.length; i++) {
+            var p = points[i];
+            pointData.push(p);
+            var key = Math.floor(p.lat / GRID_RES) + ',' + Math.floor(p.lon / GRID_RES);
+            if (!spatialGrid[key]) spatialGrid[key] = [];
+            spatialGrid[key].push(p);
+        }
+    }
+    function finalizePoints() {
         if (dotLayer) { map.removeLayer(dotLayer); }
         dotLayer = new CanvasDots({ updateWhenZooming: false, updateWhenIdle: true });
         dotLayer.addTo(map);
