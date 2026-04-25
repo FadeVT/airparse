@@ -1572,10 +1572,15 @@ class WigleView(QWidget):
             page.runJavaScript(f"appendPoints({json.dumps(points[i:i + chunk])});")
         page.runJavaScript("finalizePoints();")
         if points:
-            lats = [p['lat'] for p in points]
-            lons = [p['lon'] for p in points]
+            # 1st-99th percentile bbox so a single bad-GPS observation up in
+            # Greenland (or null-island, or stuck-tower trilateration drift)
+            # doesn't drag fitBounds across an entire continent.
+            lats = sorted(p['lat'] for p in points)
+            lons = sorted(p['lon'] for p in points)
+            n = len(lats)
+            lo, hi = max(0, n // 100), min(n - 1, n - n // 100 - 1)
             page.runJavaScript(
-                f"fitBounds({min(lats)}, {min(lons)}, {max(lats)}, {max(lons)});")
+                f"fitBounds({lats[lo]}, {lons[lo]}, {lats[hi]}, {lons[hi]});")
 
     def _generate_map_html(self) -> str:
         return '''<!DOCTYPE html>
@@ -1637,7 +1642,9 @@ class WigleView(QWidget):
             tile.height = size.y;
             var ctx = tile.getContext('2d');
             var zoom = coords.z;
-            var r = zoom >= 14 ? 3 : (zoom >= 10 ? 2 : 1);
+            // Floor at r=2 so dots stay visible at country/continent zooms,
+            // grow with zoom so individual networks become readable.
+            var r = zoom >= 14 ? 4 : (zoom >= 10 ? 3 : 2);
             // Convert tile bounds to lat/lon
             var nw = map.unproject([coords.x * size.x, coords.y * size.y], zoom);
             var se = map.unproject([(coords.x + 1) * size.x, (coords.y + 1) * size.y], zoom);
@@ -1646,7 +1653,7 @@ class WigleView(QWidget):
                 se.lat - pad, nw.lng - pad, nw.lat + pad, se.lng + pad);
             if (nearby.length === 0) return tile;
             ctx.fillStyle = '#2ecc71';
-            ctx.globalAlpha = 0.7;
+            ctx.globalAlpha = 0.9;
             for (var i = 0; i < nearby.length; i++) {
                 var p = nearby[i];
                 var pt = map.project([p.lat, p.lon], zoom);
