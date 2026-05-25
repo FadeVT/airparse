@@ -21,7 +21,7 @@ PULL_DIR = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share'
 class SourceConfig:
     source_type: str
     name: str
-    host: str
+    host: str  # last known IP (auto-discovery updates this in place)
     port: int = 22
     user: str = 'pi'
     auth: str = 'key'  # 'key' or 'password'
@@ -30,6 +30,7 @@ class SourceConfig:
     remote_path: str = ''
     file_types: list[str] = field(default_factory=list)
     enabled: bool = True
+    hostname: str = ''  # stable mDNS name (e.g. 'warpig.local'); '' = no discovery
 
     def to_dict(self) -> dict:
         return {
@@ -44,6 +45,7 @@ class SourceConfig:
             'remote_path': self.remote_path,
             'file_types': self.file_types,
             'enabled': self.enabled,
+            'hostname': self.hostname,
         }
 
     @classmethod
@@ -60,6 +62,7 @@ class SourceConfig:
             remote_path=d.get('remote_path', ''),
             file_types=d.get('file_types', []),
             enabled=d.get('enabled', True),
+            hostname=d.get('hostname', ''),
         )
 
 
@@ -224,9 +227,27 @@ class DeviceSource:
             self._ssh = None
 
     def probe(self) -> bool:
-        """Check if the device is reachable."""
-        if not self.config.host:
+        """Check if the device is reachable. Auto-rediscovers a new IP if the
+        cached one doesn't answer and the source has a mDNS hostname set.
+
+        Side effect: on successful rediscovery, mutates self.config.host to
+        the new IP so subsequent connections use it. The caller is responsible
+        for persisting the updated config back to sources.json."""
+        if not self.config.host and not self.config.hostname:
             return False
+
+        from sources.discovery import discover_host
+        working = discover_host(
+            cached_host=self.config.host,
+            hostname=self.config.hostname,
+            port=self.config.port)
+        if not working:
+            return False
+        if working != self.config.host:
+            log.info("Source %s: rediscovered at %s (was %s)",
+                     self.config.name, working, self.config.host)
+            self.config.host = working
+
         try:
             self._connect_ssh()
             return True

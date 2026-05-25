@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -319,7 +320,7 @@ class WigleApiClient:
                 },
                 method='POST')
             self._record_request()
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=600) as resp:
                 data = json.loads(resp.read())
             transid = data.get('transid', '')
             if transid:
@@ -368,12 +369,12 @@ class WigleApiClient:
             log.warning('WiGLE search failed: %s', e)
             return []
 
-    def download_kml(self, transid: str) -> tuple[bool, bytes]:
+    def download_kml(self, transid: str) -> tuple[bool, bytes, str]:
         """Download KML file for a transaction.
-        Returns (success, kml_bytes).
+        Returns (success, kml_bytes, error_message). On success error_message is ''.
         """
         if not self.has_credentials():
-            return False, b''
+            return False, b'', 'No credentials configured'
         self._wait_for_rate_limit()
         try:
             req = urllib.request.Request(
@@ -383,11 +384,23 @@ class WigleApiClient:
                     'User-Agent': 'AirParse/2.0',
                 })
             self._record_request()
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                return True, resp.read()
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                return True, resp.read(), ''
+        except urllib.error.HTTPError as e:
+            body = ''
+            try:
+                body = e.read().decode('utf-8', errors='replace')[:200]
+            except Exception:
+                pass
+            msg = f'HTTP {e.code} {e.reason}' + (f': {body}' if body else '')
+            log.warning('WiGLE KML download failed for %s: %s', transid, msg)
+            return False, b'', msg
+        except socket.timeout:
+            log.warning('WiGLE KML download timeout for %s', transid)
+            return False, b'', 'Timeout (>600s) — KML may still be generating on WiGLE'
         except Exception as e:
             log.warning('WiGLE KML download failed for %s: %s', transid, e)
-            return False, b''
+            return False, b'', f'{type(e).__name__}: {e}'
 
     def _cache_result(self, bssid_upper: str, result: WigleResult):
         cache = self._load_cache()

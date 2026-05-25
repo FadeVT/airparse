@@ -300,11 +300,12 @@ class _KmlBatchWorker(QThread):
     # status: "ok" (new file written or already present), "empty" (server
     # returned 0 bytes — transaction has no content), "error" (HTTP error,
     # timeout, etc. — transient, worth retrying later).
-    file_done = pyqtSignal(str, str)
+    file_done = pyqtSignal(str, str, str)  # transid, status, error_msg
     all_done = pyqtSignal(int)
-    def __init__(self, transids: list[str]):
+    def __init__(self, transids: list[str], force: bool = False):
         super().__init__()
         self._transids = transids
+        self._force = force
         self._cancelled = False
     def cancel(self):
         self._cancelled = True
@@ -315,11 +316,11 @@ class _KmlBatchWorker(QThread):
             if self._cancelled:
                 break
             out = _KML_DIR / f"{tid}.kml"
-            if out.exists():
-                self.file_done.emit(tid, "ok")
+            if out.exists() and not self._force:
+                self.file_done.emit(tid, "ok", '')
                 downloaded += 1
                 continue
-            ok, data = client.download_kml(tid)
+            ok, data, err = client.download_kml(tid)
             if self._cancelled:
                 break
             if ok and data:
@@ -327,11 +328,13 @@ class _KmlBatchWorker(QThread):
                 out.write_bytes(data)
                 downloaded += 1
                 status = "ok"
+                err = ''
             elif ok:
                 status = "empty"
+                err = ''
             else:
                 status = "error"
-            self.file_done.emit(tid, status)
+            self.file_done.emit(tid, status, err)
         self.all_done.emit(downloaded)
 
 
@@ -567,13 +570,15 @@ def _fmt_size(n: int) -> str:
 
 
 class WigleView(QWidget):
+    # QGIS moved to its own Mapping tab; create_qgis_page() builds the widget on demand.
     PAGE_DASHBOARD = 0
     PAGE_UPLOAD = 1
     PAGE_DOWNLOADS = 2
     PAGE_DATABASE = 3
-    PAGE_QGIS = 4
+    PAGE_SEARCH = 4
+    PAGE_CELL = 5
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, search_widget=None, cell_widget=None):
         super().__init__(parent)
         self._workers: list[QThread] = []
         self._auto_refresh_timer = QTimer(self)
@@ -581,6 +586,8 @@ class WigleView(QWidget):
         self._map_ready = False
         self._map_initialized = False
         self._pending_points = None
+        self._search_widget = search_widget
+        self._cell_widget = cell_widget
         self._setup_ui()
 
     def _setup_ui(self):
@@ -591,8 +598,15 @@ class WigleView(QWidget):
         self._stack.addWidget(self._build_upload_page())
         self._stack.addWidget(self._build_downloads_page())
         self._stack.addWidget(self._build_database_page())
-        self._stack.addWidget(self._build_qgis_page())
+        # Search and Cell are owned by MainWindow and re-parented here as pages
+        self._stack.addWidget(self._search_widget if self._search_widget else QWidget())
+        self._stack.addWidget(self._cell_widget if self._cell_widget else QWidget())
         layout.addWidget(self._stack)
+
+    def create_qgis_page(self) -> QWidget:
+        """Build the QGIS export page for embedding in the Mapping tab.
+        Workers and state live on this WigleView; only the widget is re-parented."""
+        return self._build_qgis_page()
 
     def show_page(self, index: int):
         self._stack.setCurrentIndex(index)
@@ -657,28 +671,8 @@ class WigleView(QWidget):
         stats_layout.addWidget(self._refresh_btn)
 
         layout.addWidget(stats_frame)
-
-        # ── Map (fills remaining space) ──
-        if HAS_WEBENGINE:
-            try:
-                self._map_view = QWebEngineView()
-                self._map_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-                layout.addWidget(self._map_view, 1)
-            except Exception:
-                self._map_view = None
-                layout.addWidget(QLabel("Map unavailable — WebEngine init failed"), 1)
-        else:
-            self._map_view = None
-            layout.addWidget(QLabel("Map unavailable — install PyQt6-WebEngine"), 1)
-
-        # Reload button row
-        map_btn_row = QHBoxLayout()
-        map_btn_row.addStretch()
-        self._reload_map_btn = _action_btn("Reload KML Data")
-        self._reload_map_btn.clicked.connect(self._load_kml_to_map)
-        map_btn_row.addWidget(self._reload_map_btn)
-        layout.addLayout(map_btn_row)
-
+        self._map_view = None
+        layout.addStretch(1)
         return page
 
     @staticmethod
@@ -741,6 +735,10 @@ class WigleView(QWidget):
         self._filter_btn.setToolTip("Strip blocked MACs from staged CSVs before upload")
         self._filter_btn.clicked.connect(self._filter_staged_files)
         upload_btn_row.addWidget(self._filter_btn)
+        self._remove_files_btn = _action_btn("Remove Selected", "#c0392b", "white")
+        self._remove_files_btn.setToolTip("Delete checked staged files from disk")
+        self._remove_files_btn.clicked.connect(self._remove_selected_staged)
+        upload_btn_row.addWidget(self._remove_files_btn)
         upload_btn_row.addStretch()
         self._upload_btn = _action_btn("Upload Selected", "#27ae60", "white", bold=True)
         self._upload_btn.clicked.connect(self._upload_selected)
@@ -1774,6 +1772,50 @@ class WigleView(QWidget):
             self._scan_local_btn.setText("No staged files")
             QTimer.singleShot(2000, lambda: self._scan_local_btn.setText("Scan Staged Files"))
 
+    def _remove_selected_staged(self):
+        targets = []
+        for i in range(self._upload_tree.topLevelItemCount()):
+            item = self._upload_tree.topLevelItem(i)
+            if item.checkState(0) == Qt.CheckState.Checked:
+                targets.append((i, item))
+        if not targets:
+            self._remove_files_btn.setText("Check rows first")
+            QTimer.singleShot(2000, lambda: self._remove_files_btn.setText("Remove Selected"))
+            return
+
+        names = '\n'.join(t[1].text(0) for t in targets[:8])
+        if len(targets) > 8:
+            names += f'\n… and {len(targets) - 8} more'
+        reply = QMessageBox.question(
+            self, "Delete Staged Files",
+            f"Delete {len(targets)} staged file(s) from disk?\n\n{names}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted = 0
+        errors = []
+        for _, item in targets:
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            try:
+                p = Path(path)
+                if p.exists():
+                    p.unlink()
+                deleted += 1
+            except Exception as e:
+                errors.append(f"{Path(path).name}: {e}")
+        for i in reversed([t[0] for t in targets]):
+            self._upload_tree.takeTopLevelItem(i)
+
+        msg = f"Removed {deleted} file(s)"
+        if errors:
+            msg += f"\n\nErrors:\n" + '\n'.join(errors[:5])
+            QMessageBox.warning(self, "Remove Staged Files", msg)
+        else:
+            self._remove_files_btn.setText(f"Removed {deleted}")
+            QTimer.singleShot(2000, lambda: self._remove_files_btn.setText("Remove Selected"))
+
     def _add_file_to_upload_tree(self, file_path: str):
         for i in range(self._upload_tree.topLevelItemCount()):
             if self._upload_tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole) == file_path:
@@ -2413,7 +2455,7 @@ class WigleView(QWidget):
                 transids.append(item.data(0, Qt.ItemDataRole.UserRole))
         self._start_download(transids)
 
-    def _start_download(self, transids: list[str]):
+    def _start_download(self, transids: list[str], force: bool = False):
         if not transids:
             self._dl_status.setText("Nothing to download")
             return
@@ -2426,7 +2468,7 @@ class WigleView(QWidget):
         self._dl_progress.setVisible(True)
         self._dl_progress.setMaximum(len(transids))
         self._dl_progress.setValue(0)
-        self._dl_worker = _KmlBatchWorker(transids)
+        self._dl_worker = _KmlBatchWorker(transids, force=force)
         self._dl_worker.file_done.connect(self._on_kml_file_done)
         self._dl_worker.all_done.connect(self._on_kml_batch_done)
         self._dl_worker.all_done.connect(lambda _: self._workers.remove(self._dl_worker))
@@ -2473,7 +2515,9 @@ class WigleView(QWidget):
         if multi:
             act_dl.triggered.connect(lambda: self._start_download(dl_transids))
         else:
-            act_dl.triggered.connect(lambda: self._start_download(scope_transids))
+            force_dl = scope_items[0].text(1) == "Downloaded"
+            act_dl.triggered.connect(
+                lambda _, f=force_dl: self._start_download(scope_transids, force=f))
         menu.addAction(act_dl)
 
         # Merge to QGIS KML action
@@ -2487,7 +2531,51 @@ class WigleView(QWidget):
         act_merge.triggered.connect(lambda: self._merge_selected_to_qgis(merge_transids))
         menu.addAction(act_merge)
 
+        # Delete downloaded file action
+        del_items = [
+            it for it in scope_items
+            if (_KML_DIR / f"{it.data(0, Qt.ItemDataRole.UserRole)}.kml").exists()
+        ]
+        menu.addSeparator()
+        if multi:
+            del_label = f"Delete Downloaded File(s) ({len(del_items)})"
+        else:
+            del_label = "Delete Downloaded File"
+        act_del = QAction(del_label, menu)
+        act_del.setEnabled(bool(del_items))
+        act_del.triggered.connect(lambda: self._delete_downloaded_files(del_items))
+        menu.addAction(act_del)
+
         menu.exec(self._dl_tree.viewport().mapToGlobal(pos))
+
+    def _delete_downloaded_files(self, items):
+        """Delete the local KML files for Downloads-tab rows and reset their status."""
+        if not items:
+            return
+        msg = (f"Permanently delete {len(items)} downloaded KML file(s) from "
+               f"{_KML_DIR}?\n\nThe transaction stays listed and can be "
+               f"re-downloaded from WiGLE later.")
+        resp = QMessageBox.question(
+            self, "Delete downloaded files", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        removed = 0
+        for item in items:
+            transid = item.data(0, Qt.ItemDataRole.UserRole)
+            path = _KML_DIR / f"{transid}.kml"
+            if path.exists():
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError as e:
+                    log.warning("Couldn't delete %s: %s", path, e)
+            # Row stays listed but is no longer downloaded — reset to "New".
+            item.setText(1, "New")
+            item.setForeground(1, QColor('#f39c12'))
+        self._dl_status.setText(f"Deleted {removed} downloaded file(s)")
 
     def _merge_selected_to_qgis(self, transids: list[str]):
         from datetime import datetime
@@ -2524,23 +2612,28 @@ class WigleView(QWidget):
         self._dl_status.setText(f"Merge failed: {msg}")
         QMessageBox.warning(self, "Merge failed", msg)
 
-    def _on_kml_file_done(self, transid: str, status: str):
+    def _on_kml_file_done(self, transid: str, status: str, error_msg: str = ''):
         self._dl_progress.setValue(self._dl_progress.value() + 1)
         for i in range(self._dl_tree.topLevelItemCount()):
             item = self._dl_tree.topLevelItem(i)
             if item.data(0, Qt.ItemDataRole.UserRole) == transid:
                 if status == "ok":
                     item.setText(1, "Downloaded")
+                    item.setToolTip(1, '')
                 elif status == "empty":
                     # WiGLE reports the transaction has no KML content —
                     # permanent, not worth retrying.
                     item.setText(1, "Empty")
                     item.setForeground(1, QColor('#f39c12'))
+                    item.setToolTip(1, '')
                     _add_ignored_transid(transid)
                 else:  # "error"
                     # Transient (HTTP 5xx, timeout, etc.) — leave retryable.
                     item.setText(1, "Failed")
                     item.setForeground(1, QColor('#e74c3c'))
+                    if error_msg:
+                        item.setToolTip(1, error_msg)
+                        log.warning('KML download failed for %s: %s', transid, error_msg)
                 break
 
     def _cancel_download(self):

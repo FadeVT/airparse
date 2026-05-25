@@ -1,7 +1,6 @@
 """Connect dialog for discovering devices and pulling capture data."""
 
 import logging
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -202,8 +201,12 @@ class _SourceEditorDialog(QDialog):
         form.addRow("Type:", self._type_combo)
 
         self._host_edit = QLineEdit(self._config.host)
-        self._host_edit.setPlaceholderText("IP address or hostname")
-        form.addRow("Host:", self._host_edit)
+        self._host_edit.setPlaceholderText("Last known IP (auto-updates on rediscovery)")
+        form.addRow("Host (IP):", self._host_edit)
+
+        self._hostname_edit = QLineEdit(self._config.hostname)
+        self._hostname_edit.setPlaceholderText("e.g. warpig.local (optional; enables mDNS rediscovery)")
+        form.addRow("mDNS name:", self._hostname_edit)
 
         self._port_spin = QSpinBox()
         self._port_spin.setRange(1, 65535)
@@ -287,12 +290,14 @@ class _SourceEditorDialog(QDialog):
             remote_path=self._path_edit.text().strip(),
             file_types=file_types,
             enabled=True,
+            hostname=self._hostname_edit.text().strip(),
         )
 
 
 class _ProbeWorker(QThread):
     """Background thread for probing device sources."""
-    result = pyqtSignal(int, bool, list, str)  # index, online, files, error
+    # index, online, files, error, rediscovered_host_or_empty
+    result = pyqtSignal(int, bool, list, str, str)
 
     def __init__(self, index: int, config: SourceConfig):
         super().__init__()
@@ -300,19 +305,22 @@ class _ProbeWorker(QThread):
         self._config = config
 
     def run(self):
-        if not self._config.host:
-            self.result.emit(self._index, False, [], "No host configured")
+        if not self._config.host and not self._config.hostname:
+            self.result.emit(self._index, False, [], "No host configured", '')
             return
         cls = SOURCE_CONSTRUCTORS.get(self._config.source_type, DeviceSource)
         source = cls(self._config)
+        original_host = self._config.host
         try:
             if source.probe():
+                # source.probe() may have rediscovered a new IP and mutated host
+                new_host = source.config.host if source.config.host != original_host else ''
                 files = source.list_files()
-                self.result.emit(self._index, True, files, '')
+                self.result.emit(self._index, True, files, '', new_host)
             else:
-                self.result.emit(self._index, False, [], "Connection refused")
+                self.result.emit(self._index, False, [], "Connection refused", '')
         except Exception as e:
-            self.result.emit(self._index, False, [], str(e))
+            self.result.emit(self._index, False, [], str(e), '')
 
 
 class _PullWorker(QThread):
@@ -466,9 +474,6 @@ class _PullWorker(QThread):
                             log.warning("Failed to pull %s: %s", remote_path, e)
                     source._close()
 
-                # Stage wiglecsv files for WiGLE upload
-                self._stage_wiglecsv_files(result.files_pulled, dest)
-
                 # Delete pulled files from device
                 if self._delete_after and result.files_pulled and not self._cancelled:
                     self._delete_remote_files(config, source, result)
@@ -487,39 +492,31 @@ class _PullWorker(QThread):
                 self.progress.emit("Enriching GPS data...")
                 merged.enrich_gps()
 
+            # Auto-stage the merged WiGLE CSV for upload
+            if not self._cancelled:
+                try:
+                    from datetime import datetime
+                    stage_dir = Path.home() / '.config' / 'airparse' / 'wigle_uploads'
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    merged_path = stage_dir / f'AirParse_{ts}.wiglecsv'
+                    self.progress.emit(f"Writing merged WiGLE CSV...")
+                    count = merged.export_to_wiglecsv(merged_path)
+                    if count:
+                        self.progress.emit(
+                            f"Staged {merged_path.name} ({count:,} networks)")
+                    else:
+                        try:
+                            merged_path.unlink()
+                        except OSError:
+                            pass
+                except Exception as e:
+                    log.warning("Merged WiGLE CSV staging failed: %s", e)
+
             self.finished.emit(merged, '')
 
         except Exception as e:
             log.exception("Pull worker error")
             self.finished.emit(None, str(e))
-
-    def _stage_wiglecsv_files(self, pulled_files: list[str], pull_dest: Path):
-        """Copy any wiglecsv files to the WiGLE upload staging directory."""
-        stage_dir = Path.home() / '.config' / 'airparse' / 'wigle_uploads'
-
-        def _is_wiglecsv(p: Path) -> bool:
-            name = p.name.lower()
-            return name.endswith('.wiglecsv') or (
-                name.endswith('.csv') and 'wigle' in str(p.parent).lower())
-
-        for fp in pulled_files:
-            p = Path(fp)
-            if _is_wiglecsv(p):
-                stage_dir.mkdir(parents=True, exist_ok=True)
-                staged = stage_dir / p.name
-                if not staged.exists():
-                    shutil.copy2(fp, staged)
-                    self.progress.emit(f"Staged {p.name} for WiGLE upload")
-
-        # Also check the pull directory and wigle subdirectory
-        for search_dir in [pull_dest, pull_dest / 'wigle']:
-            if search_dir.exists():
-                for existing in search_dir.iterdir():
-                    if existing.is_file() and _is_wiglecsv(existing):
-                        stage_dir.mkdir(parents=True, exist_ok=True)
-                        staged = stage_dir / existing.name
-                        if not staged.exists():
-                            shutil.copy2(str(existing), staged)
 
     def _delete_remote_files(self, config, source, result):
         """Delete successfully pulled files from the remote device."""
@@ -562,7 +559,7 @@ class _PullWorker(QThread):
                 reader = Hc22000Reader()
                 reader.open_database(path)
                 merged.ingest_hc22000(reader, source_name)
-            elif ext == '.csv' or name_lower.endswith('.csv.gz'):
+            elif ext in ('.csv', '.wiglecsv') or name_lower.endswith('.csv.gz'):
                 reader = WigleCsvReader()
                 reader.open_database(path)
                 merged.ingest_wigle(reader, source_name)
@@ -758,10 +755,16 @@ class ConnectDialog(QDialog):
             self._probe_workers.append(worker)
             worker.start()
 
-    def _on_probe_result(self, index: int, online: bool, files: list, error: str):
+    def _on_probe_result(self, index: int, online: bool, files: list,
+                         error: str, rediscovered_host: str):
         if index >= len(self._source_widgets):
             return
         sw = self._source_widgets[index]
+        if rediscovered_host:
+            sw.config.host = rediscovered_host
+            log.info("Rediscovered %s at %s; persisting to sources.json",
+                     sw.config.name, rediscovered_host)
+            self._save_all_sources()
         if online:
             total_size = sum(f.size for f in files)
             sw.set_online(len(files), total_size, files)

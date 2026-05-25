@@ -34,6 +34,8 @@ from ui.pcap_views import HandshakeView, DeauthView, ProbeMapView, FrameTypeView
 from ui.connect_dialog import ConnectDialog
 from ui.control_view import ControlView
 from ui.wigle_view import WigleView
+from ui.mapping_view import MappingView
+from ui.aggregate_pipeline import AggregatePipeline
 from cell.ui.cell_tab import CellTab
 from ui.search_view import SearchView
 from ui.settings_dialog import SettingsDialog
@@ -100,8 +102,8 @@ class MainWindow(QMainWindow):
         self.nav_tree.setHeaderLabel("Navigation")
         self.nav_tree.setMinimumWidth(100)
 
-        # Build initial nav items (View tab)
-        self._build_view_nav()
+        # Build initial nav items (Aggregate tab)
+        self._build_aggregate_nav()
 
         # Connect selection signal
         self.nav_tree.itemClicked.connect(self._on_nav_item_clicked)
@@ -109,9 +111,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.nav_tree)
         return sidebar
 
-    def _build_view_nav(self):
-        """Populate sidebar with View tab navigation items."""
+    def _build_aggregate_nav(self):
+        """Aggregate tab: Pipeline + analyzer pages (formerly View)."""
         self.nav_tree.clear()
+
+        pipeline_item = QTreeWidgetItem(["Pipeline"])
+        self.nav_tree.addTopLevelItem(pipeline_item)
 
         stats_item = QTreeWidgetItem(["Statistics"])
         self.nav_tree.addTopLevelItem(stats_item)
@@ -151,8 +156,20 @@ class MainWindow(QMainWindow):
 
         devices_item.setExpanded(True)
 
-    def _build_control_nav(self):
-        """Populate sidebar with Control tab navigation items."""
+    def _build_mapping_nav(self):
+        """Mapping tab: QGIS export pipeline."""
+        self.nav_tree.clear()
+        self.nav_tree.addTopLevelItem(QTreeWidgetItem(["QGIS Export"]))
+
+    def _build_wigle_nav(self):
+        """WiGLE tab: Dashboard, Upload, Downloads, Database, Search, Cell."""
+        self.nav_tree.clear()
+        for label in ("Dashboard", "Upload", "Downloads", "Database",
+                      "Search", "Cell"):
+            self.nav_tree.addTopLevelItem(QTreeWidgetItem([label]))
+
+    def _build_device_control_nav(self):
+        """Device Control tab: device service + filters + file management."""
         self.nav_tree.clear()
 
         kismet_item = QTreeWidgetItem(["Kismet RPi5"])
@@ -180,77 +197,48 @@ class MainWindow(QMainWindow):
         self.nav_tree.addTopLevelItem(files_item)
         files_item.setExpanded(True)
 
-    def _build_search_nav(self):
-        """Populate sidebar with Search tab navigation items."""
-        self.nav_tree.clear()
-        self.nav_tree.addTopLevelItem(QTreeWidgetItem(["Network Search"]))
-
-    def _build_wigle_nav(self):
-        """Populate sidebar with WiGLE tab navigation items."""
-        self.nav_tree.clear()
-
-        dash_item = QTreeWidgetItem(["Dashboard"])
-        self.nav_tree.addTopLevelItem(dash_item)
-
-        upload_item = QTreeWidgetItem(["Upload"])
-        self.nav_tree.addTopLevelItem(upload_item)
-
-        dl_item = QTreeWidgetItem(["Downloads"])
-        self.nav_tree.addTopLevelItem(dl_item)
-
-        db_item = QTreeWidgetItem(["Database"])
-        self.nav_tree.addTopLevelItem(db_item)
-
-        qgis_item = QTreeWidgetItem(["QGIS"])
-        self.nav_tree.addTopLevelItem(qgis_item)
-
-    def _build_cell_nav(self):
-        """Populate sidebar with Cell tab navigation items."""
-        self.nav_tree.clear()
-        self.nav_tree.addTopLevelItem(QTreeWidgetItem(["Map"]))
-
     def _on_tab_changed(self, index: int):
         """Rebuild sidebar navigation when the active tab changes."""
         if index == 0:
-            self._build_view_nav()
+            self._build_aggregate_nav()
         elif index == 1:
-            self._build_control_nav()
+            self._build_mapping_nav()
         elif index == 2:
-            self._build_search_nav()
-        elif index == 3:
             self._build_wigle_nav()
-        elif index == 4:
-            self._build_cell_nav()
+        elif index == 3:
+            self._build_device_control_nav()
 
     def _create_tab_widget(self) -> QTabWidget:
-        """Create the main tabbed content area."""
+        """Create the main tabbed content area — 4 tabs: Aggregate, Mapping, WiGLE, Device Control."""
         tab_widget = QTabWidget()
         tab_widget.setTabsClosable(True)
         tab_widget.tabCloseRequested.connect(self._close_tab)
 
-        # Create main content container (stacked widget for switching views)
+        # Aggregate tab — analyzer pages + Pipeline (the new workflow entry).
         self.content_stack = QStackedWidget()
 
-        # Create Overview/Statistics panel
+        self.aggregate_pipeline = AggregatePipeline()
+        self.aggregate_pipeline.connect_requested.connect(self._on_connect)
+        self.aggregate_pipeline.filter_requested.connect(self._on_pipeline_filter)
+        self.aggregate_pipeline.edit_blocklist_requested.connect(self._on_pipeline_edit_blocklist)
+        self.aggregate_pipeline.write_and_upload_requested.connect(self._on_pipeline_write_and_upload)
+        self.content_stack.addWidget(self.aggregate_pipeline)
+
         self.statistics_panel = StatisticsPanel()
         self.content_stack.addWidget(self.statistics_panel)
 
-        # Create reusable device table view
         self.main_table_view = DeviceTableView()
         self.main_table_view.deviceDoubleClicked.connect(self._on_device_double_clicked)
         self.content_stack.addWidget(self.main_table_view)
 
-        # Create reusable map view
         self.main_map_view = MapView()
         self.main_map_view.deviceClicked.connect(self._on_map_device_clicked)
         self.content_stack.addWidget(self.main_map_view)
 
-        # Create reusable timeline view
         self.main_timeline_view = TimelineView()
         self.main_timeline_view.timeRangeSelected.connect(self._on_timeline_range_selected)
         self.content_stack.addWidget(self.main_timeline_view)
 
-        # Create PCAP-specific views
         self.handshake_view = HandshakeView()
         self.handshake_view.show_on_map.connect(self._on_handshake_show_on_map)
         self.content_stack.addWidget(self.handshake_view)
@@ -267,41 +255,42 @@ class MainWindow(QMainWindow):
         self.networks_view = NetworksView()
         self.content_stack.addWidget(self.networks_view)
 
-        # Add the content stack as the first (and default) tab
-        tab_widget.addTab(self.content_stack, "View")
+        tab_widget.addTab(self.content_stack, "Aggregate")
 
-        # Control tab
-        self.control_view = ControlView()
-        tab_widget.addTab(self.control_view, "Control")
-
-        # Search tab
+        # Search and Cell are owned here but re-parented into WigleView as
+        # sub-pages — the WiGLE tab is the only place they're visible.
         self.search_view = SearchView()
-        tab_widget.addTab(self.search_view, "Search")
+        self.cell_view = CellTab()
 
-        # WiGLE tab
-        self.wigle_view = WigleView()
+        # WiGLE tab — Dashboard/Upload/Downloads/Database + embedded Search and Cell.
+        self.wigle_view = WigleView(
+            search_widget=self.search_view, cell_widget=self.cell_view)
+
+        # Mapping tab — QGIS page lifted out of WigleView, workers stay on WigleView.
+        self.mapping_view = MappingView(self.wigle_view.create_qgis_page())
+        tab_widget.addTab(self.mapping_view, "Mapping")
+
         tab_widget.addTab(self.wigle_view, "WiGLE")
 
-        # Cell tab (completely separate from WiGLE — own DB, own pipeline)
-        self.cell_view = CellTab()
-        tab_widget.addTab(self.cell_view, "Cell")
+        # Device Control tab — renamed from Control; internals unchanged.
+        self.control_view = ControlView()
+        tab_widget.addTab(self.control_view, "Device Control")
 
-        # Make built-in tabs non-closable
-        for i in range(5):
+        # Make built-in tabs non-closable (4 tabs).
+        for i in range(4):
             tab_widget.tabBar().setTabButton(i, tab_widget.tabBar().ButtonPosition.RightSide, None)
 
-        # Track current view name for tab title
+        # Track current view name for tab title.
         self._current_view_name = "Overview"
 
-        # Contextual sidebar — rebuild nav when tab changes
+        # Contextual sidebar — rebuild nav when tab changes.
         tab_widget.currentChanged.connect(self._on_tab_changed)
 
         return tab_widget
 
     def _update_main_tab_title(self, title: str):
-        """Update the main tab title to reflect current view."""
+        """Track current sub-view name. Tab label itself stays 'Aggregate'."""
         self._current_view_name = title
-        self.tab_widget.setTabText(0, title)
 
     def _setup_filter_dock(self):
         """Set up the filter dock widget."""
@@ -404,6 +393,11 @@ class MainWindow(QMainWindow):
         export_kml_action.triggered.connect(lambda: self.export_data('kml'))
         export_menu.addAction(export_kml_action)
 
+        export_wiglecsv_action = QAction("Export Merged &WiGLE CSV", self)
+        export_wiglecsv_action.setShortcut("Ctrl+Shift+W")
+        export_wiglecsv_action.triggered.connect(self._export_merged_wiglecsv)
+        export_menu.addAction(export_wiglecsv_action)
+
         export_menu.addSeparator()
 
         export_view_action = QAction("Export Current &View to CSV...", self)
@@ -453,34 +447,8 @@ class MainWindow(QMainWindow):
         export_btn.triggered.connect(lambda: self.export_data('csv'))
         toolbar.addAction(export_btn)
 
-        # Spacer to push Connect to the far right
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        toolbar.addWidget(spacer)
-
-        # Connect button — far right, styled to stand out
-        connect_btn = QPushButton("Connect")
-        connect_btn.setToolTip("Connect to devices and pull capture data")
-        connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        connect_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2980b9;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 5px 16px;
-                font-weight: bold;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background-color: #3498db;
-            }
-            QPushButton:pressed {
-                background-color: #2471a3;
-            }
-        """)
-        connect_btn.clicked.connect(self._on_connect)
-        toolbar.addWidget(connect_btn)
+        # Connect lives on the Aggregate → Pipeline page now; toolbar
+        # version removed as redundant.
 
     def setup_status_bar(self):
         """Set up the status bar."""
@@ -665,7 +633,7 @@ class MainWindow(QMainWindow):
             self._open_kismet_database(file_path)
         elif ext in ('.pcap', '.pcapng', '.cap'):
             self._open_pcap_file(file_path)
-        elif ext == '.csv':
+        elif ext in ('.csv', '.wiglecsv'):
             self._open_wigle_csv(file_path)
         elif ext in ('.hc22000', '.22000'):
             self._open_hc22000_file(file_path)
@@ -1226,32 +1194,33 @@ class MainWindow(QMainWindow):
             )
 
     def _on_nav_item_clicked(self, item: QTreeWidgetItem, column: int):
-        """Handle navigation tree item clicks."""
+        """Handle navigation tree item clicks. Tab indices: 0=Aggregate, 1=Mapping, 2=WiGLE, 3=Device Control."""
         item_text = item.text(0)
         current_tab = self.tab_widget.currentIndex()
 
+        # Mapping tab nav
+        if current_tab == 1:
+            if item_text == "QGIS Export":
+                self.mapping_view.show_page(MappingView.PAGE_QGIS)
+            return
+
         # WiGLE tab nav
-        if current_tab == 3:
+        if current_tab == 2:
             page_map = {
                 "Dashboard": WigleView.PAGE_DASHBOARD,
                 "Upload": WigleView.PAGE_UPLOAD,
                 "Downloads": WigleView.PAGE_DOWNLOADS,
                 "Database": WigleView.PAGE_DATABASE,
-                "QGIS": WigleView.PAGE_QGIS,
+                "Search": WigleView.PAGE_SEARCH,
+                "Cell": WigleView.PAGE_CELL,
             }
             page = page_map.get(item_text)
             if page is not None:
                 self.wigle_view.show_page(page)
             return
 
-        # Cell tab nav
-        if current_tab == 4:
-            if item_text == "Map":
-                self.cell_view.show_page(CellTab.PAGE_MAP)
-            return
-
-        # Control tab nav
-        if current_tab == 1:
+        # Device Control tab nav
+        if current_tab == 3:
             parent = item.parent()
             parent_text = parent.text(0) if parent else ""
 
@@ -1291,8 +1260,10 @@ class MainWindow(QMainWindow):
                 self.control_view.scroll_to_section(section)
             return
 
-        # View tab nav
-        if item_text == "Statistics":
+        # Aggregate tab nav (tab 0)
+        if item_text == "Pipeline":
+            self._show_pipeline()
+        elif item_text == "Statistics":
             self._show_statistics()
         elif item_text == "Access Points":
             self._show_access_points()
@@ -1320,6 +1291,61 @@ class MainWindow(QMainWindow):
             self._show_probes()
         elif item_text == "Frame Types":
             self._show_frame_types()
+
+    def _show_pipeline(self):
+        """Show the Aggregate Pipeline landing page."""
+        self.tab_widget.setCurrentIndex(0)
+        self.content_stack.setCurrentWidget(self.aggregate_pipeline)
+        self._update_main_tab_title("Pipeline")
+
+    def _on_pipeline_filter(self):
+        """Apply the MAC/OUI blocklist to the currently loaded merged DB.
+
+        Stub for now — the existing wigle_view._filter_staged_files filter
+        operates on staged CSVs, not the in-memory merged DB. Real wire-up
+        comes when the Pipeline page gets its full build."""
+        if not self.db_reader or not self.db_reader.is_connected():
+            QMessageBox.information(
+                self, "Filter",
+                "Load or merge data first (Step 1).")
+            return
+        QMessageBox.information(
+            self, "Filter",
+            "In-memory blocklist filtering will be wired in the next pass. "
+            "For now, use WiGLE → Upload → 'Filter Staged' on the exported CSV.")
+        self.aggregate_pipeline.on_filter_complete(0)
+
+    def _on_pipeline_edit_blocklist(self):
+        """Open the MAC/OUI blocklist editor (lives on the WiGLE view today)."""
+        self.wigle_view._show_blocklist_editor()
+
+    def _on_pipeline_write_and_upload(self):
+        """Write the staged AirParse_<ts>.wiglecsv, then ship it to WiGLE."""
+        from ui.wigle_view import _UploadWorker
+        result = self._write_staged_wiglecsv()
+        if result is None:
+            self.aggregate_pipeline.on_send_failed("write step failed (see prior dialog)")
+            return
+        path, count = result
+        self.aggregate_pipeline.on_write_complete(path, count)
+
+        worker = _UploadWorker([str(path)])
+        worker.file_done.connect(self._on_pipeline_upload_done)
+        # keep a ref so the worker isn't GC'd mid-flight
+        self._pipeline_upload_worker = worker
+        worker.start()
+
+    def _on_pipeline_upload_done(self, path: str, success: bool, message: str):
+        if success:
+            self.aggregate_pipeline.on_upload_complete(message)
+            # mirror WigleView's own bookkeeping: move the staged file into uploaded/
+            try:
+                from ui.wigle_view import WigleView
+                WigleView._move_to_uploaded(path)
+            except Exception:
+                pass
+        else:
+            self.aggregate_pipeline.on_send_failed(message)
 
     def _show_statistics(self):
         """Show the statistics/overview panel."""
@@ -1846,6 +1872,56 @@ class MainWindow(QMainWindow):
                 return self.db_reader.get_alerts()
             return self.db_reader.get_all_devices()
         return self.db_reader.get_all_devices()
+
+    def _export_merged_wiglecsv(self):
+        """Write the loaded dataset as a single WigleWifi-1.4 CSV ready for WiGLE upload."""
+        result = self._write_staged_wiglecsv()
+        if result is None:
+            return
+        path, count = result
+        self.status_bar.showMessage(
+            f"Wrote {count:,} networks → {path.name}", 5000)
+        QMessageBox.information(
+            self, "Merged WiGLE CSV Exported",
+            f"{count:,} networks written to:\n{path}\n\n"
+            f"Already in staging — open the WiGLE tab to upload.")
+
+    def _write_staged_wiglecsv(self) -> tuple[Path, int] | None:
+        """Write the merged DB to a fresh AirParse_<ts>.wiglecsv in staging.
+
+        Returns (path, network_count) on success, None on failure.
+        Surfaces error dialogs for unsupported reader or empty output.
+        """
+        if not self.db_reader or not self.db_reader.is_connected():
+            QMessageBox.warning(self, "No Data", "Load or merge data first.")
+            return None
+        if not hasattr(self.db_reader, 'export_to_wiglecsv'):
+            QMessageBox.warning(self, "Not Supported",
+                "Merged WiGLE export requires a merged database (use Connect → Pull & Merge).")
+            return None
+
+        from datetime import datetime
+        stage_dir = Path.home() / '.config' / 'airparse' / 'wigle_uploads'
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        out_path = stage_dir / f'AirParse_{ts}.wiglecsv'
+
+        try:
+            count = self.db_reader.export_to_wiglecsv(out_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed",
+                                 f"Could not write merged CSV:\n{e}")
+            return None
+
+        if not count:
+            QMessageBox.warning(self, "No Data",
+                "No GPS-tagged WiFi networks to export. WiGLE requires lat/lon per row.")
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+            return None
+
+        return out_path, count
 
     def _export_csv(self, df, file_path: str, options: dict) -> bool:
         """Export to CSV format."""

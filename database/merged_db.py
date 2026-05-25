@@ -105,6 +105,70 @@ class MergedDatabase:
     def is_connected(self) -> bool:
         return self._is_loaded
 
+    def export_to_wiglecsv(self, path) -> int:
+        """Write merged networks as a WigleWifi-1.4 CSV. Returns row count written."""
+        import csv
+        import re
+        from datetime import datetime
+        from pathlib import Path
+
+        mac_re = re.compile(r'^[0-9a-f]{2}(:[0-9a-f]{2}){5}$')
+
+        def _auth(enc: str) -> str:
+            e = (enc or '').strip().lower()
+            if e in ('wpa3', 'wpa3-sae'):
+                return '[WPA3-SAE-CCMP][ESS]'
+            if e == 'wpa2':
+                return '[WPA2-PSK-CCMP][ESS]'
+            if e == 'wpa':
+                return '[WPA-PSK-CCMP][ESS]'
+            if e == 'wep':
+                return '[WEP][ESS]'
+            if e in ('open', '', 'none', 'unknown'):
+                return '[ESS]'
+            return f'[{enc}][ESS]'
+
+        rows = []
+        for net in self._networks.values():
+            bssid = (net.bssid or '').lower()
+            if not mac_re.match(bssid):
+                continue
+            lat = net.min_lat if net.min_lat else net.lat
+            lon = net.min_lon if net.min_lon else net.lon
+            if not lat or not lon:
+                continue
+            first_seen = datetime.fromtimestamp(net.first_time).strftime(
+                '%Y-%m-%d %H:%M:%S') if net.first_time else ''
+            rows.append({
+                'MAC': bssid.upper(),
+                'SSID': net.ssid or '',
+                'AuthMode': _auth(net.encryption),
+                'FirstSeen': first_seen,
+                'Channel': net.channel or 0,
+                'RSSI': net.strongest_signal if net.strongest_signal else -100,
+                'CurrentLatitude': f'{lat:.6f}',
+                'CurrentLongitude': f'{lon:.6f}',
+                'AltitudeMeters': '0.000000',
+                'AccuracyMeters': '0',
+                'Type': 'WIFI',
+            })
+
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        sources = ','.join(self._source_names) if self._source_names else 'AirParse'
+        header = (f'WigleWifi-1.4,appRelease=AirParse,model=AirParse,release=1.0,'
+                  f'device=AirParse,display=AirParse,board=AirParse,brand=AirParse,'
+                  f'sources={sources}')
+        columns = ['MAC', 'SSID', 'AuthMode', 'FirstSeen', 'Channel', 'RSSI',
+                   'CurrentLatitude', 'CurrentLongitude', 'AltitudeMeters',
+                   'AccuracyMeters', 'Type']
+        with open(out_path, 'w', newline='', encoding='utf-8') as f:
+            f.write(header + '\n')
+            writer = csv.DictWriter(f, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
+        return len(rows)
+
     # --- Ingestion methods ---
 
     def ingest_pcap(self, reader, source_name: str, pcap_path: str = ''):
@@ -291,23 +355,34 @@ class MergedDatabase:
         if not ap_df.empty:
             for _, row in ap_df.iterrows():
                 mac = str(row.get('devmac', row.get('mac', ''))).lower()
-                if not mac:
+                if not mac or mac == 'nan':
                     continue
+
+                def _num(v, default, cast):
+                    if v is None or (isinstance(v, float) and pd.isna(v)) or v == '':
+                        return default
+                    try:
+                        return cast(v)
+                    except (TypeError, ValueError):
+                        return default
+
+                channel_raw = row.get('channel', 0)
+                channel = _num(channel_raw, 0, int) if str(channel_raw).lstrip('-').isdigit() else 0
                 self._merge_network(
                     bssid=mac,
                     ssid=str(row.get('name', row.get('ssid', ''))),
-                    channel=int(row.get('channel', 0) or 0) if str(row.get('channel', '')).isdigit() else 0,
+                    channel=channel,
                     encryption=str(row.get('encryption', 'Unknown')),
                     manufacturer=str(row.get('manufacturer', '')),
-                    signal=int(row.get('strongest_signal', -100) or -100),
+                    signal=_num(row.get('strongest_signal', -100), -100, int),
                     first_time=self._ts_to_epoch(row.get('first_time')),
                     last_time=self._ts_to_epoch(row.get('last_time')),
-                    lat=float(row.get('min_lat', row.get('lat', 0)) or 0),
-                    lon=float(row.get('min_lon', row.get('lon', 0)) or 0),
-                    min_lat=float(row.get('min_lat', 0) or 0),
-                    max_lat=float(row.get('max_lat', 0) or 0),
-                    min_lon=float(row.get('min_lon', 0) or 0),
-                    max_lon=float(row.get('max_lon', 0) or 0),
+                    lat=_num(row.get('min_lat', row.get('lat', 0)), 0.0, float),
+                    lon=_num(row.get('min_lon', row.get('lon', 0)), 0.0, float),
+                    min_lat=_num(row.get('min_lat', 0), 0.0, float),
+                    max_lat=_num(row.get('max_lat', 0), 0.0, float),
+                    min_lon=_num(row.get('min_lon', 0), 0.0, float),
+                    max_lon=_num(row.get('max_lon', 0), 0.0, float),
                     source=source_name,
                 )
 
